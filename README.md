@@ -5,7 +5,7 @@
 
 ## Возможности
 - 🔍 Поиск через **Google Custom Search JSON API** (`GOOGLE_API_KEY` + `GOOGLE_CX_ID`)
-- 🤖 **ИИ-ответ** над выдачей: модель получает фрагменты результатов поиска и даёт краткий ответ со ссылками на источники (OpenAI / Groq / Ollama / OpenRouter — любой OpenAI-совместимый API)
+- 🤖 **ИИ-ответ** над выдачей: модель получает фрагменты результатов поиска и даёт краткий ответ со ссылками на источники — через бесплатный **Pollinations.AI** (ключ не нужен)
 - 🔐 Обязательный **вход через Google-аккаунт** для веб-интерфейса
 - ⚙️ **REST API для других проектов** как у OpenAI: без ключа — `403`, с ключом — работает
 - 🌗 Тёмная и светлая тема (переключатель в шапке, запоминается в браузере)
@@ -27,7 +27,7 @@ python app.py      # сервер на http://localhost:4000
 | `GOOGLE_API_KEY`, `GOOGLE_CX_ID` | Ключ и CX-ID вашего поисковика (programmablesearchengine.google.com) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth 2.0 клиент (console.cloud.google.com → Credentials). Redirect URI: `http://localhost:4000/auth/callback` |
 | `SECRET_KEY` | Ключ подписи сессий Flask |
-| `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` | OpenAI-совместимый API для ИИ-ответа (можно оставить пустым — тогда блок ИИ отключается) |
+| `AI_ENABLED`, `POLLINATIONS_URL`, `POLLINATIONS_MODEL` | ИИ-ответ через бесплатный Pollinations.AI (ключ не требуется). `AI_ENABLED=0` — отключить блок ИИ |
 | `SEARCH_API_KEYS` | Список ключей через запятую для программного доступа к `/api/v1/*` |
 | `PORT` | Порт сервера (по умолчанию 4000) |
 

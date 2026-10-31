@@ -6,7 +6,7 @@ SearchGPT — собственный поисковик на базе Google Cus
   * Поиск через Google CSE (GOOGLE_API_KEY + GOOGLE_CX_ID)
   * Обязательный вход через Google-аккаунт (OAuth 2.0) для веб-интерфейса
   * Публичный REST API (/api/v1/search) с ключами доступа (403 без ключа)
-  * AI-ответ поверх выдачи (OpenAI-совместимый API, опционально)
+  * AI-ответ поверх выдачи через Pollinations.AI (бесплатно, без ключа)
   * Тёмная / светлая тема, интерфейс в стиле Google
 
 Работает на Termux:  pip install -r requirements.txt && python app.py
@@ -43,9 +43,13 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_hex(32)
 
-AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-AI_BASE_URL = (os.getenv("AI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"))
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
+# ИИ-ответ генерируется через Pollinations.AI — бесплатный OpenAI-совместимый
+# API (https://github.com/pollinations/pollinations), ключ не требуется.
+POLLINATIONS_URL = os.getenv(
+    "POLLINATIONS_URL", "https://text.pollinations.ai/openai"
+).strip().rstrip("/")
+POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "openai").strip()
+AI_ENABLED = os.getenv("AI_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 
 PORT = int(os.getenv("PORT", "4000"))
 
@@ -127,8 +131,12 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS):
 
 
 def ai_answer(query: str, results: list) -> str | None:
-    """Генерирует краткий ИИ-ответ на основе выдачи поиска."""
-    if not (AI_API_KEY and AI_BASE_URL):
+    """Генерирует краткий ИИ-ответ через Pollinations.AI (бесплатно, без ключа).
+
+    Модель получает фрагменты результатов поиска и отвечает на их основе.
+    Pollinations предоставляет OpenAI-совместимый эндпоинт /v1/chat/completions.
+    """
+    if not AI_ENABLED:
         return None
     context_lines = []
     for i, it in enumerate(results[:8], 1):
@@ -154,18 +162,21 @@ def ai_answer(query: str, results: list) -> str | None:
     ]
     try:
         r = requests.post(
-            f"{AI_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {AI_API_KEY}",
-                "Content-Type": "application/json",
+            f"{POLLINATIONS_URL}/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": POLLINATIONS_MODEL,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 700,
             },
-            json={"model": AI_MODEL, "messages": messages, "temperature": 0.3,
-                  "max_tokens": 700},
-            timeout=40,
+            timeout=60,
         )
         if r.status_code != 200:
             return None
-        return r.json()["choices"][0]["message"]["content"].strip()
+        data = r.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return content or None
     except Exception:
         return None
 
@@ -281,7 +292,7 @@ def search_page():
         error=error,
         ai=ai,
         page=page,
-        ai_enabled=bool(AI_API_KEY and AI_BASE_URL),
+        ai_enabled=AI_ENABLED,
     )
 
 
@@ -346,7 +357,7 @@ def api_answer():
     sources = [{"title": i["title"], "url": i["link"]} for i in items[:8]]
     if answer is None:
         return jsonify({"answer": None, "sources": sources,
-                        "detail": "AI_API_KEY / AI_BASE_URL не настроены"}), 200
+                        "detail": "ИИ-ответ отключён (AI_ENABLED=0) или Pollinations недоступен"}), 200
     return jsonify({"answer": answer, "sources": sources})
 
 
@@ -375,7 +386,8 @@ def health():
             "status": "ok",
             "cse_configured": bool(GOOGLE_API_KEY and GOOGLE_CX_ID),
             "oauth_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
-            "ai_configured": bool(AI_API_KEY and AI_BASE_URL),
+            "ai_provider": "pollinations.ai",
+            "ai_configured": AI_ENABLED,
             "api_keys_loaded": len(SEARCH_API_KEYS),
         }
     )
