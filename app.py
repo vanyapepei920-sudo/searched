@@ -21,7 +21,8 @@ import os
 import re
 import secrets
 import sqlite3
-from urllib.parse import urlencode
+import time
+from urllib.parse import urlencode, urlparse, quote
 
 import requests
 from dotenv import load_dotenv
@@ -60,20 +61,35 @@ SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_hex(32)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 
-def oauth_redirect_uri() -> str:
-    """redirect_uri, который реально уходит в Google (и должен быть в консоли)."""
+def public_origin() -> str:
+    """Публичный адрес сайта (scheme://host[:port]) — источник redirect_uri."""
     if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL + "/auth/callback"
-    # авто-определение: учитываем X-Forwarded-Proto/Host от прокси (ngrok и т.п.)
+        return PUBLIC_BASE_URL
+    # Прокси (cloudpub/ngrok/cloudflared): смотрим служебные заголовки.
+    for h in ("X-Forwarded-Prefix", ):
+        pass  # префиксы не поддерживаем — приложение живёт в корне домена
     fwd_host = request.headers.get("X-Forwarded-Host")
     if fwd_host:
         scheme = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
-        return f"{scheme}://{fwd_host}/auth/callback"
-    try:
-        return url_for("callback", _external=True)
-    except RuntimeError:
-        base = request.url_root.rstrip("/")
-        return base + "/auth/callback"
+        host = fwd_host.split(",")[0].strip()
+        return f"{scheme}://{host}"
+    host = request.headers.get("Host") or ""
+    if host:
+        # Если прокси сообщил, что снаружи это https — не отдаём http-адрес
+        xf_proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+        scheme = "https" if (xf_proto == "https" or request.is_secure) else "http"
+        return f"{scheme}://{host}"
+    return request.url_root.rstrip("/")
+
+
+def oauth_redirect_uri() -> str:
+    """redirect_uri, который реально уходит в Google (и должен быть в консоли).
+
+    ВАЖНО: Google сверяет этот адрес со списком в Cloud Console строго
+    посимвольно (схема, хост, порт, слэш). Добавляйте в консоль ровно то,
+    что показывает страница /auth/redirect-uri при текущем способе входа.
+    """
+    return public_origin() + "/auth/callback"
 
 # ИИ-ответ генерируется через Pollinations.AI — бесплатный OpenAI-совместимый
 # API (https://github.com/pollinations/pollinations), ключ не требуется.
@@ -283,19 +299,123 @@ def is_signed_in() -> bool:
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+# Публичный metadata OAuth-клиента (для диагностики redirect_uri_mismatch)
+GOOGLE_CLIENT_METADATA_URL = "https://cloudresourcemanager.googleapis.com/v1/clientIds/"
+
+
+# Кэш ответа Google Cloud Console по OAuth-клиенту (нужен только для
+# диагностики ошибки redirect_uri_mismatch).
+_CLIENT_DIAG_CACHE = {"ts": 0.0, "data": None}
+
+
+def client_id_diagnostic() -> dict:
+    """Достаёт из Google конфигурацию OAuth-клиента по его client_id.
+
+    Публичный metadata-эндпоинт возвращает authorized_redirect_uris клиента —
+    ровно тот список, с которым Google сверяет redirect_uri. Если запрос не
+    удался (нет ключа/интернета), тихо возвращаем пустой словарь.
+    """
+    if not GOOGLE_CLIENT_ID:
+        return {}
+    now = time.time()
+    if _CLIENT_DIAG_CACHE["data"] is not None and now - _CLIENT_DIAG_CACHE["ts"] < 60:
+        return _CLIENT_DIAG_CACHE["data"]
+    data: dict = {}
+    try:
+        r = requests.get(
+            GOOGLE_CLIENT_METADATA_URL
+            + quote(GOOGLE_CLIENT_ID, safe=""),
+            timeout=8,
+        )
+        if r.status_code == 200:
+            j = r.json()
+            web = j.get("web") or {}
+            uris = [u.rstrip("/") for u in web.get("authorizedRedirectUris", [])]
+            data = {
+                "redirect_uris": uris,
+                "client_name": web.get("name", ""),
+                "available": True,
+            }
+    except Exception:
+        pass
+    _CLIENT_DIAG_CACHE.update({"ts": now, "data": data})
+    return data
+
+
+def pick_redirect_uri() -> str:
+    """Выбирает redirect_uri, который точно есть в настройках клиента.
+
+    1) PUBLIC_BASE_URL задан вручную — используем его без вопросов;
+    2) иначе пробуем адрес, вычисленный из текущего запроса;
+    3) если он не совпадает со списком из консоли (когда список доступен),
+       берём первое http(s)-совпадение по хосту — это лечит mismatch при
+       доступе через прокси (https снаружи / http внутри).
+    """
+    candidate = oauth_redirect_uri()
+    diag = client_id_diagnostic()
+    allowed = diag.get("redirect_uris") or []
+    if not allowed or candidate.rstrip("/") in allowed:
+        return candidate
+    # подбираем похожий адрес из списка консоли
+    host = urlparse(candidate).netloc
+    same_host = [u for u in allowed if urlparse(u).netloc == host]
+    if same_host:
+        return same_host[0]
+    app.logger.warning(
+        "redirect_uri %s отсутствует в консоли Google; доступны: %s",
+        candidate, allowed,
+    )
+    return candidate
 
 
 def build_google_auth_url(state: str, next_url: str = "/") -> str:
     params = {
         "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": oauth_redirect_uri(),
+        "redirect_uri": pick_redirect_uri(),
         "response_type": "code",
+        # openid обязателен для обмена кода на токены с профилем Google
         "scope": "openid email profile",
-        "access_type": "offline",
+        "access_type": "online",
         "prompt": "select_account",
         "state": state,
     }
     return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+
+
+# ----------------------------------------------------------------------------
+# OAuth state: серверный реестр состояний входа. Cookie-сессии может не
+# дождаться через сторонние прокси (cloudpub/ngrok/cloudflared) — тогда
+# callback отклонялся без причины. state живёт 10 минут и используется один раз.
+# ----------------------------------------------------------------------------
+OAUTH_STATES: dict = {}   # state -> {"next": str, "exp": float}
+
+
+def _remember_state(state: str, next_url: str, redirect_uri: str) -> None:
+    now = time.time()
+    for k in [k for k, v in OAUTH_STATES.items() if v["exp"] < now]:
+        OAUTH_STATES.pop(k, None)
+    OAUTH_STATES[state] = {
+        "next": safe_next(next_url),
+        "uri": redirect_uri,
+        "exp": now + 600,
+    }
+
+
+def _state_ok(state: str) -> bool:
+    rec = OAUTH_STATES.get(state)
+    return bool(rec and rec["exp"] > time.time())
+
+
+def _state_data(state: str) -> dict:
+    """Возвращает и удаляет запись состояния (одноразовое использование)."""
+    rec = OAUTH_STATES.pop(state, None)
+    if rec is None:
+        # куки дожили — используем запасной вариант из сессии
+        return {
+            "next": safe_next(session.pop("oauth_next", "/")),
+            "uri": session.pop("oauth_used_uri", "") or oauth_redirect_uri(),
+        }
+    return rec
 
 
 def google_button() -> str:
@@ -311,8 +431,14 @@ def google_button() -> str:
     """
 
 
-def google_exchange_code(code: str):
-    """Обменивает authorization code на access token."""
+def google_exchange_code(code: str, redirect_uri: str):
+    """Обменивает authorization code на access token.
+
+    ВАЖНО: redirect_uri здесь должен быть ровно тем же адресом, что был
+    отправлен в Google при авторизации (иначе Google вернёт
+    invalid_grant / redirect_uri_mismatch). Поэтому он прокидывается через
+    session["oauth_used_uri"], а не вычисляется заново на ходу.
+    """
     try:
         r = requests.post(
             GOOGLE_TOKEN_URL,
@@ -321,7 +447,7 @@ def google_exchange_code(code: str):
                 "client_secret": GOOGLE_CLIENT_SECRET,
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": oauth_redirect_uri(),
+                "redirect_uri": redirect_uri or oauth_redirect_uri(),
             },
             timeout=15,
         )
@@ -509,7 +635,14 @@ def safe_next(target: str, default: str = "/") -> str:
 @app.route("/login", methods=["GET", "POST"])
 def login_page():
     nxt = safe_next(request.values.get("next", ""))
-    error = ""
+    error = request.args.get("error", "")
+    if error == "state":
+        error = "Сессия входа истекла. Нажмите «Продолжить с Google» ещё раз."
+    elif error == "cookies":
+        error = ("Браузер или прокси не сохранил cookie сайта — войдите через "
+                 "обычную форму (логин и пароль) или откройте сайт напрямую.")
+    else:
+        error = ""
     if request.method == "POST":
         login = request.form.get("login", "").strip()
         password = request.form.get("password", "")
@@ -604,17 +737,59 @@ def login():
                 "и укажите Redirect URI: <code>http://localhost:4000/auth/callback</code>."
             ),
         )
+    # Проверяем, что redirect_uri хотя бы похож на валидный адрес Google
+    # (схема http/https, есть хост). Это ловит опечатки в PUBLIC_BASE_URL до
+    # того, как пользователь увидит «недопустимый запрос» от Google.
+    uri = oauth_redirect_uri()
+    parsed = urlparse(uri)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return render_template(
+            "error.html",
+            title="Некорректный PUBLIC_BASE_URL",
+            detail=(
+                f"redirect_uri получился неверным: <code>{uri}</code>.<br>"
+                "Проверьте переменную PUBLIC_BASE_URL в .env — она должна быть "
+                "вида <code>https://ваш-домен</code> или "
+                "<code>http://localhost:4000</code> (без слэша на конце)."
+            ),
+        )
     state = secrets.token_urlsafe(16)
-    session["oauth_state"] = state
+    session["oauth_state"] = state          # запасной вариант (если куки доживут)
     session["oauth_next"] = safe_next(request.args.get("next", ""))
+    session["oauth_used_uri"] = uri         # тот же uri используем при обмене кода
+    _remember_state(state, request.args.get("next", ""), uri)
     return redirect(build_google_auth_url(state))
 
 
 @app.route("/auth/redirect-uri")
 def redirect_uri_info():
     """Показывает redirect_uri, который приложение отправляет в Google.
-    Откройте эту страницу в браузере и скопируйте адрес в Google Cloud Console."""
+    Откройте эту страницу в браузере (по тому адресу, по которому заходите
+    на сайт) и скопируйте показанный адрес в Google Cloud Console."""
     uri = oauth_redirect_uri()
+    origin = public_origin()
+    host = urlparse(origin).hostname or ""
+    # полезные варианты для localhost-тестов
+    extras = []
+    if host in ("localhost", "127.0.0.1"):
+        extras = [
+            f"http://localhost:{PORT}/auth/callback",
+            f"http://127.0.0.1:{PORT}/auth/callback",
+        ]
+    allowed = (client_id_diagnostic().get("redirect_uris") or [])
+    listing = "".join(
+        f"<li><code>{u}</code></li>" for u in ([uri] + [e for e in extras if e != uri])
+    )
+    console_note = ""
+    if allowed:
+        ok = uri.rstrip("/") in allowed
+        console_note = (
+            "<br><br>Список URI из консоли Google: "
+            + ", ".join(f"<code>{u}</code>" for u in allowed)
+            + ("<br>✅ Текущий адрес присутствует в списке."
+               if ok else
+               "<br>⚠️ Текущего адреса нет в списке — добавьте его.")
+        )
     return render_template(
         "error.html",
         title="Ваш OAuth Redirect URI",
@@ -623,29 +798,49 @@ def redirect_uri_info():
             f"OAuth 2.0 клиент «Веб-приложение»</b> и добавьте этот адрес в поле "
             f"<b>«Авторизованные URI перенаправления»</b> (сохраните):<br><br>"
             f"<code style='font-size:16px'>{uri}</code><br><br>"
-            f"Затем подождите 1–2 минуты (консоль обновляет настройки не мгновенно) "
-            f"и войдите заново: <a href='/auth/login'>/auth/login</a>.<br><br>"
-            f"Если вы открываете сайт через ngrok/cloudflared или по IP — добавьте "
-            f"в консоль ровно тот адрес, по которому заходите в браузер."
+            f"Рекомендуем добавить сразу все:<ul>{listing}</ul>"
+            f"Затем подождите 1–2 минуты и войдите заново: "
+            f"<a href='/auth/login'>/auth/login</a>.<br><br>"
+            f"Если вы открываете сайт через ngrok/cloudflared/cloudpub или по IP — "
+            f"добавьте в консоль ровно тот адрес, по которому заходите в браузер "
+            f"(сейчас это <code>{origin}</code>).<br><br>"
+            f"URL, который уходит в Google прямо сейчас:<br>"
+            f"<code style='font-size:12px;word-break:break-all'>"
+            f"{build_google_auth_url('DEMO_STATE')}</code>"
+            f"{console_note}"
         ),
     )
 
 
 @app.route("/auth/callback")
 def callback():
-    nxt = session.pop("oauth_next", "/")
-    if request.args.get("state") != session.get("oauth_state"):
-        return redirect(url_for("login_page"))
+    # Состояние (state) храним сервером, а не только в cookie: сторонние
+    # прокси (cloudpub/ngrok и т.п.) могут терять cookie, и тогда вход
+    # отклонялся бы без причины — см. OAUTH_STATES.
+    state = request.args.get("state", "")
+    if not _state_ok(state):
+        return redirect(url_for("login_page", error="state"))
+    rec = _state_data(state)
+    nxt = rec["next"]
+    used_uri = rec.get("uri") or oauth_redirect_uri()
+    session.pop("oauth_state", None)
     error = request.args.get("error", "")
     if error == "redirect_uri_mismatch":
+        uri = oauth_redirect_uri()
         return render_template(
             "error.html",
             title="Ошибка входа: redirect_uri_mismatch",
             detail=(
-                "Google отклонил redirect_uri приложения.<br><br>"
-                "Перейдите на <a href='/auth/redirect-uri'>/auth/redirect-uri</a>, "
-                "скопируйте показанный адрес и добавьте его в Google Cloud Console "
-                "в раздел «URI перенаправления» вашего OAuth-клиента."
+                "Google отклонил адрес перенаправления приложения.<br><br>"
+                "Добавьте в Google Cloud Console → «URI перенаправления» вашего "
+                "OAuth-клиента РОВНО этот адрес (сохраните и подождите ~1 минуту):"
+                f"<br><br><code style='font-size:15px'>{uri}</code><br><br>"
+                "Если вы добавили его через <a href='/auth/redirect-uri'>"
+                "/auth/redirect-uri</a> и ошибка осталась — проверьте, что вход "
+                "вы делаете по тому же адресу (https/домен), которому соответствует "
+                "этот redirect_uri, или задайте PUBLIC_BASE_URL в .env.<br><br>"
+                "<a href='/auth/login'>Попробовать ещё раз</a> | "
+                "<a href='/login'>обычный вход</a>"
             ),
         )
     code = request.args.get("code", "")
@@ -658,7 +853,7 @@ def callback():
             title="Не удалось войти через Google",
             detail=detail + "<br><br>Попробуйте ещё раз: <a href='/auth/login'>вход через Google</a> или обычный <a href='/login'>/login</a>",
         )
-    tokens = google_exchange_code(code)
+    tokens = google_exchange_code(code, used_uri)
     if not tokens or "access_token" not in tokens:
         return render_template(
             "error.html",
@@ -933,14 +1128,7 @@ def api_instant():
 
 @app.route("/health")
 def health():
-    # redirect_uri считаем вручную (вне request-контекста url_for недоступен)
-    if PUBLIC_BASE_URL:
-        uri = PUBLIC_BASE_URL + "/auth/callback"
-    else:
-        try:
-            uri = url_for("callback", _external=True)
-        except RuntimeError:
-            uri = f"http://localhost:{PORT}/auth/callback"
+    uri = oauth_redirect_uri()
     return jsonify(
         {
             "status": "ok",
