@@ -25,9 +25,9 @@ from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
+from markupsafe import Markup
 from flask import (
     Flask,
-    Markup,
     jsonify,
     redirect,
     render_template,
