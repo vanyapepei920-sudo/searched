@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from markupsafe import Markup
 from flask import (
     Flask,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -37,6 +38,10 @@ from flask import (
     session,
     url_for,
 )
+try:  # Flask >= 2.0 отдаёт escape из markupsafe, но на всякий случай — fallback
+    from flask import escape
+except ImportError:
+    from markupsafe import escape
 
 load_dotenv()
 
@@ -108,6 +113,8 @@ SEARCH_API_KEYS = {
 }
 
 CSE_URL = "https://www.googleapis.com/customsearch/v1"
+CSE_ENABLE_LINK = ("https://console.cloud.google.com/apis/library/customsearch.googleapis.com"
+                   "?project=_")
 NUM_RESULTS = 10
 
 # ----------------------------------------------------------------------------
@@ -128,7 +135,103 @@ SETTINGS_DEFAULTS = {
     "search_engine": "auto",            # auto | google | duckduckgo
     "cse_key": "",                      # свой GOOGLE_API_KEY (если пуст — из .env)
     "cse_id": "",                       # свой GOOGLE_CX_ID (если пуст — из .env)
+    # Диагностика Google CSE: статус API и поисковой системы (см. /settings/diag)
+    "cse_api_status": "",               # ok | error:<msg> | "" (не проверялось)
+    "cse_api_checked_at": 0,            # unix-time последней проверки
+    "cse_sys_ok": None,                 # None|True|False — жив ли CX (кнопка «Проверить»)
+    "cse_sys_checked_at": 0,
 }
+
+# Кэш диагностики статуса Custom Search JSON API для проекта ключа
+# (чтобы не дёргать Cloud Billing API на каждом запросе). {key_prefix: (ts, status)}
+CSE_DIAG_CACHE = {}
+CSE_DIAG_TTL = 600  # 10 минут
+
+
+def _short_err(e) -> str:
+    """Короткое текстовое описание ошибки requests/HTTP."""
+    try:
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                msg = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                msg = ""
+            return f"HTTP {resp.status_code}" + (f": {msg[:200]}" if msg else "")
+    except Exception:
+        pass
+    return str(e)[:200]
+
+
+def cse_api_diag(api_key: str):
+    """Диагностика по Cloud Billing API: список проектов с включённым
+    Custom Search JSON API для данного ключа. Возвращает (status, текст),
+    где status: 'ok' | 'not_enabled' | 'no_projects' | 'invalid_key' | 'net_error'.
+
+    Это точный ответ на ошибку «This project does not have the access to
+    Custom Search JSON API»: она означает, что проект, которому принадлежит
+    КЛЮЧ, не имеет включённого API (даже если вы включили его в другом проекте).
+    """
+    if not api_key:
+        return ("no_key", "GOOGLE_API_KEY не задан")
+    ck = api_key[:8]
+    hit = CSE_DIAG_CACHE.get(ck)
+    now = time.time()
+    if hit and now - hit[0] < CSE_DIAG_TTL:
+        return hit[1]
+    result = None
+    try:
+        r = requests.get(
+            "https://cloudbilling.googleapis.com/v1/services",
+            params={"key": api_key, "pageSize": 300},
+            timeout=15,
+        )
+        if r.status_code == 400 or r.status_code == 403:
+            msg = ""
+            try:
+                msg = r.json().get("error", {}).get("message", "").lower()
+            except Exception:
+                pass
+            if "api key" in msg and ("not valid" in msg or "invalid" in msg):
+                result = ("invalid_key", "API-ключ недействителен (проверьте значение)")
+            else:
+                result = ("no_projects", "Не удалось получить список проектов (403): " + msg[:150])
+        elif r.status_code != 200:
+            result = ("no_projects", f"Cloud Billing API: HTTP {r.status_code}")
+        else:
+            found = []
+            for s in r.json().get("billingServices", []):
+                if s.get("displayName") == "Custom Search API" or \
+                        s.get("name", "").endswith("/customsearch"):
+                    found.append(s.get("serviceId", "customsearch.googleapis.com"))
+            if found:
+                result = ("ok", "Custom Search JSON API включён в проекте ключа")
+            else:
+                result = ("not_enabled",
+                          "В проекте этого API-ключа Custom Search JSON API НЕ включён")
+    except requests.RequestException as e:
+        result = ("net_error", "Сеть недоступна: " + _short_err(e))
+    CSE_DIAG_CACHE[ck] = (now, result)
+    return result
+
+
+def check_cx_alive(api_key: str, cx_id: str):
+    """Живой мини-тест CX: один запрос к CSE с num=1. Возвращает (ok, сообщение)."""
+    if not api_key or not cx_id:
+        return (False, "Нужны и ключ, и CX")
+    try:
+        r = requests.get(CSE_URL, params={"key": api_key, "cx": cx_id,
+                                          "q": "test", "num": 1}, timeout=15)
+        if r.status_code == 200:
+            n = len(r.json().get("items", []) or [])
+            return (True, f"CX работает, тестовая выдача: {n} результат(ов)")
+        try:
+            msg = r.json().get("error", {}).get("message", r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        return (False, f"Google вернул {r.status_code}: {msg}")
+    except requests.RequestException as e:
+        return (False, "Сеть: " + _short_err(e))
 
 VALID_MODELS = ["openai", "mistral", "llama", "deepseek", "searchgpt"]
 VALID_LANGS = {"ru": "Русский", "en": "English", "ua": "Українська", "es": "Español", "de": "Deutsch"}
@@ -205,9 +308,15 @@ def inject_globals():
         st = get_settings()
     except Exception:
         st = dict(SETTINGS_DEFAULTS)
+
+    def nl2br(text):
+        """Экранирует текст и переводит переносы строк в <br> (безопасно)."""
+        return Markup(escape(str(text)).replace("\n", "<br>\n"))
+
     return {
         "st": st,
         "lang_name": VALID_LANGS.get(st["language"], "Русский"),
+        "nl2br": nl2br,
     }
 
 
@@ -625,6 +734,16 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool 
                 msg = r.text
             cse_error = f"Google API: {msg}"
             help_text = _cse_error_help(msg)
+            # Авто-диагностика при ошибках доступа к API: результат кладём в
+            # g.cse_diag — страница результатов покажет точный статус и ссылку.
+            low = msg.lower()
+            if ("does not have the access" in low or "not been used" in low
+                    or "access not config" in low):
+                try:
+                    st_status, st_text = cse_api_diag(api_key)
+                    g.cse_diag = {"status": st_status, "text": st_text}
+                except Exception:
+                    pass
             if help_text:
                 cse_error += "\n💡 " + help_text
         except requests.RequestException as e:
@@ -1081,6 +1200,8 @@ def search_page(query=None):
         ai_enabled=st["ai_enabled"],
         results_per_page_num=st["results_per_page"],
         on_results=True,
+        cse_diag=getattr(g, "cse_diag", None),
+        cse_enable_link=CSE_ENABLE_LINK,
     )
 
 
@@ -1128,6 +1249,15 @@ def settings_page():
     if request.args.get("saved") == "1":
         saved = True
 
+    # Статус Custom Search JSON API для текущего ключа (для раздела диагностики)
+    eff_key = st.get("cse_key") or GOOGLE_API_KEY
+    api_status, api_text = ("", "")
+    if eff_key:
+        try:
+            api_status, api_text = cse_api_diag(eff_key)
+        except Exception:
+            api_status, api_text = ("net_error", "Диагностика недоступна")
+
     return render_template(
         "settings.html",
         user=get_current_user(),
@@ -1138,7 +1268,36 @@ def settings_page():
         valid_rpp=VALID_RPP,
         redirect_uri=oauth_redirect_uri(),
         oauth_configured=bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        cse_has_key=bool(eff_key),
+        cse_has_cx=bool(st.get("cse_id") or GOOGLE_CX_ID),
+        cse_api_status=api_status,
+        cse_api_text=api_text,
+        cse_sys_ok=st.get("cse_sys_ok"),
+        cse_enable_link=CSE_ENABLE_LINK,
     )
+
+
+@app.route("/settings/diag")
+def settings_diag():
+    """AJAX-проверки из страницы настроек: check=api | check=cx."""
+    st = get_settings()
+    check = request.args.get("check", "api")
+    key = st.get("cse_key") or GOOGLE_API_KEY
+    cx = st.get("cse_id") or GOOGLE_CX_ID
+    if check == "cx":
+        ok, msg = check_cx_alive(key, cx)
+        new_st = dict(st)
+        new_st["cse_sys_ok"] = ok
+        new_st["cse_sys_checked_at"] = int(time.time())
+        resp = jsonify({"ok": ok, "message": msg})
+        return settings_response(resp, new_st)
+    status, text = cse_api_diag(key)
+    return jsonify({
+        "status": status,
+        "message": text,
+        "enable_link": CSE_ENABLE_LINK,
+        "hint": _cse_error_help(text) or _cse_error_help(status),
+    })
 
 
 # ----------------------------------------------------------------------------

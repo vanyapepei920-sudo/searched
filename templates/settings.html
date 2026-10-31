@@ -99,6 +99,60 @@
         <input type="text" name="cse_id" value="{{ st.cse_id }}" placeholder="a1b2c3d4e5f6g7h8i" autocomplete="off">
       </div>
 
+      <div class="set-card-inner diag-box" style="border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin:10px 0">
+        <h2 style="margin-top:0;font-size:15px">🔧 Диагностика Google Custom Search API</h2>
+        {% if not cse_has_key %}
+          <p class="muted small">GOOGLE_API_KEY не задан ни в .env, ни выше — диагностика недоступна.</p>
+        {% else %}
+          <p class="small" id="apiDiagLine">
+            Статус API в проекте ключа:
+            {% if cse_api_status == 'ok' %}
+              <b style="color:#34a853">✅ включён</b>
+            {% elif cse_api_status == 'not_enabled' %}
+              <b style="color:#ea4335">❌ НЕ включён</b> — это и есть причина ошибки «This project does not have the access to Custom Search JSON API»
+            {% elif cse_api_status == 'invalid_key' %}
+              <b style="color:#ea4335">❌ ключ недействителен</b>
+            {% elif cse_api_status %}
+              <b style="color:#fbbc04">⚠️ {{ cse_api_text or cse_api_status }}</b>
+            {% else %}
+              <span class="muted">не проверялось</span>
+            {% endif %}
+          </p>
+          {% if cse_api_status != 'ok' %}
+            <ol class="small" style="line-height:1.6">
+              <li>Откройте <a href="{{ cse_enable_link }}" target="_blank" rel="noopener">страницу включения Custom Search JSON API</a>.</li>
+              <li><b>Вверху страницы выберите тот же проект</b>, которому принадлежит ваш API-ключ (Credentials → ключ → столбец «Framework/проект»). Ошибка возникает, когда API включён в одном проекте, а ключ создан в другом.</li>
+              <li>Нажмите «Включить», дождитесь 1–2 минуты и нажмите «Проверить статус API» здесь.</li>
+            </ol>
+          {% endif %}
+          <p class="small" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button type="button" class="btn-copy" id="btnApiDiag">Проверить статус API</button>
+            {% if cse_has_cx %}<button type="button" class="btn-copy" id="btnCxTest">Тест поиска (CX)</button>{% endif %}
+            <span id="diagResult" class="muted small"></span>
+          </p>
+          <script>
+            const dr = document.getElementById('diagResult');
+            async function runDiag(check) {
+              dr.textContent = 'Проверяю…';
+              try {
+                const r = await fetch('/settings/diag?check=' + check);
+                const j = await r.json();
+                if (check === 'cx') {
+                  dr.innerHTML = (j.ok ? '<b style="color:#34a853">✅ ' : '<b style="color:#ea4335">❌ ') + (j.message || '') + '</b>';
+                } else {
+                  let s = '<b>' + (j.status === 'ok' ? '✅ включён' : '❌ ' + (j.message || j.status)) + '</b>';
+                  if (j.hint) s += '<br><span class="muted">' + j.hint + '</span>';
+                  dr.innerHTML = s;
+                }
+              } catch (e) { dr.textContent = 'Ошибка сети: ' + e; }
+            }
+            document.getElementById('btnApiDiag').addEventListener('click', () => runDiag('api'));
+            const bcx = document.getElementById('btnCxTest');
+            if (bcx) bcx.addEventListener('click', () => runDiag('cx'));
+          </script>
+        {% endif %}
+      </div>
+
       <label class="set-row toggle-row">
         <span class="set-label">Безопасный поиск (фильтрация нежелательного контента)</span>
         <label class="switch">

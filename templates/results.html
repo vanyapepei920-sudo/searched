@@ -14,11 +14,33 @@
 <main class="results-layout">
   <div class="results-main">
     {% if error %}
-      <div class="alert">⚠️ {{ error|e.replace('\n', '<br>')|safe }}</div>
+      <div class="alert">⚠️ {{ nl2br(error) }}</div>
     {% endif %}
 
     {% if results and results.warning %}
-      <div class="alert alert-warn">ℹ️ {{ results.warning|e.replace('\n', '<br>')|safe }}</div>
+      <div class="alert alert-warn">ℹ️ {{ nl2br(results.warning) }}</div>
+    {% endif %}
+
+    {% if cse_diag %}
+      <div class="alert alert-warn">🔧 <b>Диагностика:</b>
+        {% if cse_diag.status == 'ok' %}
+          <b style="color:#34a853">Custom Search JSON API в проекте ключа включён.</b>
+          Если Google всё ещё отвечает ошибкой доступа — подождите 2–5 минут после включения
+          или проверьте, что GOOGLE_CX_ID создан именно в этом проекте
+          (<a href="https://programmablesearchengine.google.com/controlpanel/all" target="_blank" rel="noopener">панель поисковых систем</a>).
+        {% elif cse_diag.status == 'not_enabled' %}
+          <b style="color:#ea4335">В проекте этого API-ключа Custom Search JSON API НЕ включён</b> —
+          даже если вы включали его в другом проекте. Откройте
+          <a href="{{ cse_enable_link }}" target="_blank" rel="noopener">страницу включения</a>,
+          <b>сверху выберите проект вашего ключа</b> и нажмите «Включить».
+          Либо создайте новый API-ключ в проекте, где API уже включён, и вставьте его в
+          <a href="/settings">Настройках</a>.
+        {% elif cse_diag.status == 'invalid_key' %}
+          <b style="color:#ea4335">API-ключ недействителен</b> — проверьте GOOGLE_API_KEY в .env или в Настройках.
+        {% else %}
+          {{ cse_diag.text }}
+        {% endif %}
+      </div>
     {% endif %}
 
     {% if results and results.items %}
