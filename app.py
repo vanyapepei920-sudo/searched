@@ -125,6 +125,9 @@ SETTINGS_DEFAULTS = {
     "instant_answers": True,            # мгновенные ответы ИИ прямо на главной
     "sound": False,                     # звук при ответе ИИ
     "autosuggest": True,                # подсказки в строке поиска
+    "search_engine": "auto",            # auto | google | duckduckgo
+    "cse_key": "",                      # свой GOOGLE_API_KEY (если пуст — из .env)
+    "cse_id": "",                       # свой GOOGLE_CX_ID (если пуст — из .env)
 }
 
 VALID_MODELS = ["openai", "mistral", "llama", "deepseek", "searchgpt"]
@@ -160,6 +163,12 @@ def get_settings() -> dict:
         s["results_per_page"] = 10
     if s["results_per_page"] not in VALID_RPP:
         s["results_per_page"] = 10
+    if s["search_engine"] not in ("auto", "google", "duckduckgo"):
+        s["search_engine"] = "auto"
+    for k in ("cse_key", "cse_id"):
+        if not isinstance(s.get(k), str):
+            s[k] = ""
+        s[k] = s[k].strip()
     for b in ("safe_search", "ai_enabled", "new_tab", "instant_answers", "sound", "autosuggest"):
         s[b] = bool(s[b])
     if s["language"] not in VALID_LANGS:
@@ -476,56 +485,160 @@ def google_userinfo(access_token: str):
 # ----------------------------------------------------------------------------
 # Вспомогательные функции поиска / ИИ
 # ----------------------------------------------------------------------------
-def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool = True):
-    """Запрос к Google Custom Search API. Возвращает dict или {'error': ...}."""
-    if not (GOOGLE_API_KEY and GOOGLE_CX_ID):
-        return {"error": "GOOGLE_API_KEY / GOOGLE_CX_ID не настроены в .env"}
+CSE_ERROR_HINTS = {
+    "does not have the access to custom search json api": (
+        "API включён в одном проекте, а ключ GOOGLE_API_KEY взят из ДРУГОГО проекта. "
+        "В Cloud Console сверху выберите проект, где включён Custom Search JSON API, "
+        "и создайте API-ключ именно там (Credentials → Create credentials → API key). "
+        "Проект ключа виден на странице console.cloud.google.com/apis/credentials."
+    ),
+    "custom search json api has not been used": (
+        "Custom Search JSON API не включено в проекте ключа: Cloud Console → "
+        "«API и службы» → «Библиотека» → Custom Search JSON API → Включить."
+    ),
+    "api key not valid": (
+        "GOOGLE_API_KEY неверный или скопирован с пробелами — проверьте значение в .env."
+    ),
+}
+
+
+def _cse_error_help(msg: str) -> str:
+    low = msg.lower()
+    for needle, hint in CSE_ERROR_HINTS.items():
+        if needle in low:
+            return hint
+    if "quota" in low or "limit" in low:
+        return ("Превышена квота Custom Search API (бесплатно 100 запросов в день). "
+                "Попробуйте завтра или используйте второй ключ.")
+    return ""
+
+
+def _parse_cse(data: dict, page: int, num: int):
+    items = []
+    for it in data.get("items", []):
+        pagemap = it.get("pagemap", {}) or {}
+        thumb = None
+        if pagemap.get("cse_thumbnail"):
+            thumb = pagemap["cse_thumbnail"][0].get("src")
+        items.append(
+            {
+                "title": it.get("title", ""),
+                "link": it.get("link", ""),
+                "snippet": it.get("snippet", ""),
+                "displayLink": it.get("displayLink", ""),
+                "thumbnail": thumb,
+            }
+        )
+    qi = data.get("searchInformation", {})
+    total = int(qi.get("totalResults", "0") or 0)
+    return {
+        "items": items,
+        "total": total,
+        "searchTime": qi.get("searchTime"),
+        "hasMore": page * num < total,
+    }
+
+
+def duckduckgo_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool = True):
+    """Резервный поиск через DuckDuckGo (без ключей, Termux-friendly).
+
+    Автоматически используется, если Google CSE недоступен (ошибки доступа/API),
+    чтобы поисковик продолжал работать.
+    """
+    offset = max(0, (page - 1) * 10)
+    last_err = None
+    headers = {"User-Agent": "Mozilla/5.0 (Android; Mobile) SearchGPT/1.0"}
     try:
+        rr = requests.get("https://duckduckgo.com/", params={"q": query},
+                          headers=headers, timeout=10)
+        m = re.search(r"vqd=([\d-]+)", rr.text)
+        vqd = m.group(1) if m else ""
         r = requests.get(
-            CSE_URL,
-            params={
-                "key": GOOGLE_API_KEY,
-                "cx": GOOGLE_CX_ID,
-                "q": query,
-                "num": min(num, 10),
-                "start": max(page, 1) * num - num + 1,
-                **({"safe": "active"} if safe else {}),
-            },
+            "https://duckduckgo.com/i.js",
+            params={"q": query, "vqd": vqd, "f": "json", "kl": "ru-es"},
+            headers={**headers, "Referer": "https://duckduckgo.com/"},
             timeout=15,
         )
         if r.status_code != 200:
+            return {"error": f"DuckDuckGo: HTTP {r.status_code}"}
+        results = r.json().get("results", [])
+        items = []
+        for it in results[offset:offset + num]:
+            link = it.get("url", "")
+            host = urlparse(link).netloc
+            snippet = re.sub(r"<[^>]+>", "", it.get("abstract", "") or "")
+            title = re.sub(r"<[^>]+>", "", it.get("title", "") or "")
+            items.append({"title": title, "link": link, "snippet": snippet,
+                          "displayLink": host, "thumbnail": None})
+        if not items:
+            return {"error": "DuckDuckGo: пустая выдача"}
+        return {
+            "items": items,
+            "total": len(results),
+            "searchTime": None,
+            "hasMore": offset + num < len(results),
+            "provider": "duckduckgo",
+        }
+    except (requests.RequestException, ValueError) as e:
+        return {"error": f"Резервный поиск недоступен: {e}"}
+
+
+def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool = True):
+    """Сначала Google Custom Search API; при ошибке — авто-fallback на DuckDuckGo.
+
+    Ключ и CX можно переопределить в «Настройках» (cse_key/cse_id) — удобно,
+    когда ключ из другого проекта или кончилась квота. search_engine=duckduckgo
+    полностью отключает Google и использует резервный поиск.
+    """
+    try:
+        st = get_settings()
+    except Exception:
+        st = dict(SETTINGS_DEFAULTS)
+    engine = st.get("search_engine", "auto")
+    api_key = st.get("cse_key") or GOOGLE_API_KEY
+    cx_id = st.get("cse_id") or GOOGLE_CX_ID
+
+    cse_error = None
+    if engine == "duckduckgo":
+        return duckduckgo_search(query, page=page, num=num, safe=safe)
+    if api_key and cx_id:
+        try:
+            r = requests.get(
+                CSE_URL,
+                params={
+                    "key": api_key,
+                    "cx": cx_id,
+                    "q": query,
+                    "num": min(num, 10),
+                    "start": max(page, 1) * num - num + 1,
+                    **({"safe": "active"} if safe else {}),
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                out = _parse_cse(r.json(), page, num)
+                out["provider"] = "google"
+                return out
             try:
                 msg = r.json().get("error", {}).get("message", r.text)
             except Exception:
                 msg = r.text
-            return {"error": f"Google API: {msg}"}
-        data = r.json()
-        items = []
-        for it in data.get("items", []):
-            pagemap = it.get("pagemap", {}) or {}
-            thumb = None
-            if pagemap.get("cse_thumbnail"):
-                thumb = pagemap["cse_thumbnail"][0].get("src")
-            items.append(
-                {
-                    "title": it.get("title", ""),
-                    "link": it.get("link", ""),
-                    "snippet": it.get("snippet", ""),
-                    "displayLink": it.get("displayLink", ""),
-                    "thumbnail": thumb,
-                }
-            )
-        qi = data.get("searchInformation", {})
-        total = int(qi.get("totalResults", "0") or 0)
-        return {
-            "items": items,
-            "total": total,
-            "searchTime": qi.get("searchTime"),
-            "hasMore": page * num < total,
-        }
-    except requests.RequestException as e:
-        return {"error": f"Сеть недоступна: {e}"}
+            cse_error = f"Google API: {msg}"
+            help_text = _cse_error_help(msg)
+            if help_text:
+                cse_error += "\n💡 " + help_text
+        except requests.RequestException as e:
+            cse_error = f"Сеть недоступна для Google API: {e}"
+    else:
+        cse_error = "GOOGLE_API_KEY / GOOGLE_CX_ID не настроены в .env"
 
+    # --- Fallback: DuckDuckGo без ключей — поиск работает всегда ---
+    ddg = duckduckgo_search(query, page=page, num=num, safe=safe)
+    if "items" in ddg:
+        ddg["warning"] = (cse_error or "Google CSE недоступен") + \
+            "\nПоказаны результаты резервного поиска DuckDuckGo."
+        return ddg
+    return {"error": cse_error, "help": _cse_error_help(cse_error or "")}
 
 def ai_answer(query: str, results: list, model=None):
     """Генерирует краткий ИИ-ответ через Pollinations.AI (бесплатно, без ключа).
@@ -1004,6 +1117,9 @@ def settings_page():
             )
         except Exception:
             pass
+        new["search_engine"] = request.form.get("search_engine", st["search_engine"])
+        new["cse_key"] = request.form.get("cse_key", st["cse_key"]).strip()
+        new["cse_id"] = request.form.get("cse_id", st["cse_id"]).strip()
         for b in ("safe_search", "ai_enabled", "new_tab", "instant_answers", "sound", "autosuggest"):
             new[b] = request.form.get(b) == "on"
         resp = redirect(url_for("settings_page", saved=1))

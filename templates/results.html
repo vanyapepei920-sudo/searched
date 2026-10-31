@@ -14,11 +14,22 @@
 <main class="results-layout">
   <div class="results-main">
     {% if error %}
-      <div class="alert">⚠️ {{ error }}</div>
+      <div class="alert">⚠️ {{ error|e.replace('\n', '<br>')|safe }}</div>
+    {% endif %}
+
+    {% if results and results.warning %}
+      <div class="alert alert-warn">ℹ️ {{ results.warning|e.replace('\n', '<br>')|safe }}</div>
     {% endif %}
 
     {% if results and results.items %}
-      <div class="stats muted">Примерно {{ '{:,}'.format(results.total) }} результатов ({{ results.searchTime }} с.)</div>
+      <div class="stats muted">
+        {% if results.searchTime %}
+          Примерно {{ '{:,}'.format(results.total) }} результатов ({{ results.searchTime }} с.)
+        {% else %}
+          Около {{ '{:,}'.format(results.total) }} результатов
+        {% endif %}
+        {% if results.provider == 'duckduckgo' %}<span class="muted small">· источник: DuckDuckGo</span>{% endif %}
+      </div>
 
       {% if ai %}
         <section class="ai-card" data-sound="{{ '1' if st.sound else '0' }}">

@@ -80,6 +80,25 @@
     <section class="set-card">
       <h2>Поиск</h2>
 
+      <div class="set-row">
+        <span class="set-label">Источник поиска</span>
+        <select name="search_engine">
+          <option value="auto" {% if st.search_engine=='auto' %}selected{% endif %}>Google, при ошибке — DuckDuckGo (рекомендуется)</option>
+          <option value="google" {% if st.search_engine=='google' %}selected{% endif %}>Только Google CSE</option>
+          <option value="duckduckgo" {% if st.search_engine=='duckduckgo' %}selected{% endif %}>Только DuckDuckGo (без ключей)</option>
+        </select>
+      </div>
+
+      <div class="set-row">
+        <span class="set-label">Свой GOOGLE_API_KEY <span class="muted small">(пусто = из .env; вставьте ключ из проекта, где включён Custom Search JSON API)</span></span>
+        <input type="text" name="cse_key" value="{{ st.cse_key }}" placeholder="AIza..." autocomplete="off">
+      </div>
+
+      <div class="set-row">
+        <span class="set-label">Свой GOOGLE_CX_ID <span class="muted small">(пусто = из .env)</span></span>
+        <input type="text" name="cse_id" value="{{ st.cse_id }}" placeholder="a1b2c3d4e5f6g7h8i" autocomplete="off">
+      </div>
+
       <label class="set-row toggle-row">
         <span class="set-label">Безопасный поиск (фильтрация нежелательного контента)</span>
         <label class="switch">

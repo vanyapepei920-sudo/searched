@@ -302,3 +302,7 @@ a { color:var(--blue); text-decoration:none; }
 }
 .btn-google:hover { background:var(--bg2); box-shadow:0 1px 4px var(--shadow); }
 .auth-switch { margin-top:18px; font-size:14px; }
+
+/* Предупреждение (например, fallback на DuckDuckGo) */
+.alert-warn { background:#fef7e0; color:#b06000; border:1px solid #fde293; }
+[data-theme="dark"] .alert-warn { background:#3a2f14; color:#fdd663; border-color:#5a4a1e; }
