@@ -14,15 +14,20 @@ SearchGPT — собственный поисковик на базе Google Cus
 Работает на Termux:  pkg install python && pip install -r requirements.txt && python app.py
 """
 
+import hashlib
+import hmac
 import json
 import os
+import re
 import secrets
+import sqlite3
 from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
 from flask import (
     Flask,
+    Markup,
     jsonify,
     redirect,
     render_template,
@@ -182,6 +187,96 @@ def inject_globals():
 
 
 # ----------------------------------------------------------------------------
+# Пользователи: регистрация / вход (SQLite из стандартной библиотеки Python —
+# никаких дополнительных пакетов, работает на Termux).
+# Пароли хранятся как PBKDF2-хэш с индивидуальной солью, без openpyxl/bcrypt.
+# ----------------------------------------------------------------------------
+DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 username TEXT UNIQUE NOT NULL,
+                 email TEXT DEFAULT '',
+                 pw_hash TEXT NOT NULL,
+                 pw_salt TEXT NOT NULL,
+                 provider TEXT DEFAULT 'local',
+                 picture TEXT DEFAULT '',
+                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+
+
+init_db()
+
+PBKDF2_ITERATIONS = 120_000
+
+
+def hash_password(password: str, salt_hex: str | None = None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return digest.hex(), salt.hex()
+
+
+def verify_password(password: str, pw_hash: str, salt_hex: str) -> bool:
+    digest, _ = hash_password(password, salt_hex)
+    return hmac.compare_digest(digest, pw_hash)
+
+
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{3,30}$")
+
+
+def get_current_user():
+    """Пользователь из Flask-сессии (локальный аккаунт или вход через Google)."""
+    u = session.get("user")
+    if not u:
+        return None
+    # Вход через Google: данные уже в сессии, дополнительно подтянем username
+    if u.get("provider") == "google":
+        name = u.get("g_name") or u.get("name") or "Пользователь"
+        if u.get("id"):
+            row = db().execute(
+                "SELECT username FROM users WHERE id=?", (u["id"],)
+            ).fetchone()
+            if row:
+                name = row["username"]
+        return {
+            "id": u.get("id"),
+            "name": name,
+            "email": u.get("email", ""),
+            "picture": u.get("picture", ""),
+            "provider": "google",
+        }
+    row = db().execute(
+        "SELECT id, username, email, provider, picture FROM users WHERE id=?",
+        (u.get("id"),),
+    ).fetchone()
+    if not row:
+        session.pop("user", None)
+        return None
+    return {
+        "id": row["id"],
+        "name": row["username"],
+        "email": row["email"] or "",
+        "picture": row["picture"] or "",
+        "provider": row["provider"],
+    }
+
+
+def is_signed_in() -> bool:
+    return get_current_user() is not None
+
+
+# ----------------------------------------------------------------------------
 # Google OAuth 2.0 на чистом requests (без authlib — никаких нативных
 # зависимостей, все пакеты ставятся чистым pip, работает на Termux)
 # ----------------------------------------------------------------------------
@@ -190,7 +285,7 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
-def build_google_auth_url(state: str) -> str:
+def build_google_auth_url(state: str, next_url: str = "/") -> str:
     params = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": oauth_redirect_uri(),
@@ -201,6 +296,19 @@ def build_google_auth_url(state: str) -> str:
         "state": state,
     }
     return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+
+
+def google_button() -> str:
+    """HTML кнопки «Войти через Google» для страниц /login и /register."""
+    if not GOOGLE_CLIENT_ID:
+        return ""
+    return """
+    <div class="or-sep"><span>или</span></div>
+    <a class="btn-google" href="/auth/login">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.4a5.5 5.5 0 0 1-2.4 3.6v3h3.9c2.3-2.1 3.6-5.2 3.6-8.8z"/><path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.4 1.2-4.1 1.2-3.1 0-5.8-2.1-6.7-5H1.2v3.1A12 12 0 0 0 12 24z"/><path fill="#FBBC05" d="M5.3 14.3a7.2 7.2 0 0 1 0-4.6V6.6H1.2a12 12 0 0 0 0 10.8l4.1-3.1z"/><path fill="#EA4335" d="M12 4.7c1.8 0 3.3.6 4.6 1.8L20 3A12 12 0 0 0 1.2 6.6l4.1 3.1C6.2 6.8 8.9 4.7 12 4.7z"/></svg>
+      Продолжить с Google
+    </a>
+    """
 
 
 def google_exchange_code(code: str):
@@ -355,39 +463,141 @@ def check_api_key() -> bool:
 
 
 # ----------------------------------------------------------------------------
-# Защита веб-интерфейса: обязателен вход через Google
+# Защита веб-интерфейса: вход через страницу /login (или Google) обязателен.
+# На главную, логин и регистрацию пускаем без аккаунта.
 # ----------------------------------------------------------------------------
+PUBLIC_PATHS = (
+    "/auth/login",
+    "/auth/callback",
+    "/auth/logout",
+    "/auth/redirect-uri",  # диагностика redirect_uri_mismatch
+    "/login",
+    "/register",
+    "/api/",              # REST API защищён отдельными ключами
+    "/static/",
+    "/favicon.ico",
+    "/health",
+)
+
+
 @app.before_request
-def require_google_login():
+def require_login():
     path = request.path
-    public = (
-        "/auth/login",
-        "/auth/callback",
-        "/auth/logout",
-        "/auth/redirect-uri",  # диагностика redirect_uri_mismatch
-        "/api/",              # REST API защищён отдельными ключами
-        "/static/",
-        "/favicon.ico",
-        "/health",
-    )
-    if any(path.startswith(p) for p in public):
+    if path == "/" or any(path.startswith(p) for p in PUBLIC_PATHS):
         return None
-    if not session.get("user"):
-        return redirect(url_for("login"))
+    if not is_signed_in():
+        nxt = request.full_path if request.query_string else request.path
+        return redirect(url_for("login_page", next=nxt))
     return None
 
 
+@app.context_processor
+def inject_user():
+    return {"user": get_current_user()}
+
+
 # ----------------------------------------------------------------------------
-# Маршруты авторизации
+# Маршруты авторизации: страницы /login и /register + Google OAuth
 # ----------------------------------------------------------------------------
+def safe_next(target: str, default: str = "/") -> str:
+    """Разрешаем только внутренние редиректы (защита от open-redirect)."""
+    if target and target.startswith("/") and not target.startswith("//"):
+        return target
+    return default
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    nxt = safe_next(request.values.get("next", ""))
+    error = ""
+    if request.method == "POST":
+        login = request.form.get("login", "").strip()
+        password = request.form.get("password", "")
+        row = None
+        if login and password:
+            if "@" in login:
+                row = db().execute(
+                    "SELECT * FROM users WHERE lower(email)=lower(?) AND provider='local'",
+                    (login,),
+                ).fetchone()
+            else:
+                row = db().execute(
+                    "SELECT * FROM users WHERE username=? AND provider='local'",
+                    (login,),
+                ).fetchone()
+        if row and verify_password(password, row["pw_hash"], row["pw_salt"]):
+            session["user"] = {
+                "id": row["id"],
+                "name": row["username"],
+                "email": row["email"] or "",
+                "picture": row["picture"] or "",
+                "provider": "local",
+            }
+            return redirect(nxt)
+        error = "Неверный логин или пароль."
+    gbtn = Markup(google_button().replace("/auth/login", f"/auth/login?{urlencode({'next': nxt})}")) if google_button() else Markup("")
+    return render_template("login.html", error=error, next=nxt, user=get_current_user(), google_btn=gbtn)
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register_page():
+    nxt = safe_next(request.values.get("next", ""), default="/")
+    error, values = "", {"username": "", "email": ""}
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "")
+        password2 = request.form.get("password2", "")
+        values = {"username": username, "email": email}
+
+        if not USERNAME_RE.match(username):
+            error = "Имя пользователя: 3–30 символов, только латиница, цифры, точка, _ или -."
+        elif len(password) < 6:
+            error = "Пароль должен быть не короче 6 символов."
+        elif password != password2:
+            error = "Пароли не совпадают."
+        elif email and "@" not in email:
+            error = "Некорректный e-mail."
+        else:
+            conn = db()
+            exists = conn.execute(
+                "SELECT 1 FROM users WHERE username=? OR (email!= '' AND lower(email)=lower(?))",
+                (username, email),
+            ).fetchone()
+            if exists:
+                error = "Такой пользователь уже зарегистрирован — войдите через /login."
+            else:
+                pw_hash, pw_salt = hash_password(password)
+                cur = conn.execute(
+                    "INSERT INTO users (username, email, pw_hash, pw_salt, provider)"
+                    " VALUES (?,?,?,?, 'local')",
+                    (username, email, pw_hash, pw_salt),
+                )
+                conn.commit()
+                session["user"] = {
+                    "id": cur.lastrowid,
+                    "name": username,
+                    "email": email,
+                    "picture": "",
+                    "provider": "local",
+                }
+                return redirect(nxt)
+    gbtn = Markup(google_button().replace("/auth/login", f"/auth/login?{urlencode({'next': nxt})}")) if google_button() else Markup("")
+    return render_template("register.html", error=error, values=values, next=nxt,
+                           user=get_current_user(), google_btn=gbtn)
+
+
 @app.route("/auth/login")
 def login():
+    """Вход через Google-аккаунт (OAuth 2.0)."""
     if not GOOGLE_CLIENT_ID:
         return render_template(
             "error.html",
             title="Не настроен вход через Google",
             detail=(
                 "В файле .env не заполнены GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET.<br>"
+                "Можно войти через обычный аккаунт: <a href='/login'>/login</a> "
+                "или <a href='/register'>/register</a>.<br><br>"
                 "Создайте OAuth 2.0 клиента на "
                 "<a href='https://console.cloud.google.com/apis/credentials'>"
                 "console.cloud.google.com/apis/credentials</a> "
@@ -396,6 +606,7 @@ def login():
         )
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
+    session["oauth_next"] = safe_next(request.args.get("next", ""))
     return redirect(build_google_auth_url(state))
 
 
@@ -422,8 +633,9 @@ def redirect_uri_info():
 
 @app.route("/auth/callback")
 def callback():
+    nxt = session.pop("oauth_next", "/")
     if request.args.get("state") != session.get("oauth_state"):
-        return redirect(url_for("login"))
+        return redirect(url_for("login_page"))
     error = request.args.get("error", "")
     if error == "redirect_uri_mismatch":
         return render_template(
@@ -444,7 +656,7 @@ def callback():
         return render_template(
             "error.html",
             title="Не удалось войти через Google",
-            detail=detail + "<br><br>Попробуйте ещё раз: <a href='/auth/login'>/auth/login</a>",
+            detail=detail + "<br><br>Попробуйте ещё раз: <a href='/auth/login'>вход через Google</a> или обычный <a href='/login'>/login</a>",
         )
     tokens = google_exchange_code(code)
     if not tokens or "access_token" not in tokens:
@@ -460,12 +672,47 @@ def callback():
             ),
         )
     userinfo = google_userinfo(tokens["access_token"]) or {}
+    email = userinfo.get("email", "")
+    name = userinfo.get("name") or (email.split("@")[0] if email else "Пользователь")
+    picture = userinfo.get("picture", "")
+
+    # Привязываем Google-аккаунт к локальной таблице пользователей
+    conn = db()
+    row = None
+    if email:
+        row = conn.execute(
+            "SELECT * FROM users WHERE lower(email)=lower(?)", (email,)
+        ).fetchone()
+    if not row:
+        base = re.sub(r"[^a-zA-Z0-9._-]", "", name)[:30] or "user"
+        uname = base
+        suffix = 1
+        while conn.execute(
+            "SELECT 1 FROM users WHERE username=?", (uname,)
+        ).fetchone():
+            uname = f"{base}{suffix}"[:30]
+            suffix += 1
+        pw_hash, pw_salt = hash_password(secrets.token_hex(16))
+        cur = conn.execute(
+            "INSERT INTO users (username, email, pw_hash, pw_salt, provider, picture)"
+            " VALUES (?,?,?,?, 'google', ?)",
+            (uname, email, pw_hash, pw_salt, picture),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
+    elif picture and (row["picture"] or "") != picture:
+        conn.execute("UPDATE users SET picture=? WHERE id=?", (picture, row["id"]))
+        conn.commit()
+
     session["user"] = {
-        "name": userinfo.get("name", "Пользователь"),
-        "email": userinfo.get("email", ""),
-        "picture": userinfo.get("picture", ""),
+        "id": row["id"],
+        "name": row["username"],
+        "email": email or (row["email"] or ""),
+        "picture": picture or (row["picture"] or ""),
+        "provider": "google",
+        "g_name": name,
     }
-    return redirect(url_for("index"))
+    return redirect(nxt if nxt.startswith("/") else "/")
 
 
 @app.route("/auth/logout")
@@ -481,7 +728,7 @@ def logout():
 def index():
     return render_template(
         "index.html",
-        user=session.get("user"),
+        user=get_current_user(),
         query="",
         results=None,
         error=None,
@@ -517,7 +764,7 @@ def search_page(query=None):
 
     return render_template(
         "results.html",
-        user=session.get("user"),
+        user=get_current_user(),
         query=query,
         results=results,
         error=error,
@@ -572,7 +819,7 @@ def settings_page():
 
     return render_template(
         "settings.html",
-        user=session.get("user"),
+        user=get_current_user(),
         st=st,
         saved=saved,
         valid_models=VALID_MODELS,
@@ -672,7 +919,7 @@ def api_models():
 @app.route("/api/v1/instant")
 def api_instant():
     """Лёгкий эндпоинт для мгновенного ответа ИИ на главной (для залогиненных)."""
-    if not session.get("user") or not get_settings()["instant_answers"]:
+    if not is_signed_in() or not get_settings()["instant_answers"]:
         return jsonify({"answer": None}), 200
     query = request.args.get("q", "").strip()
     if len(query) < 4:

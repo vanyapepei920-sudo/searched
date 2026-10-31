@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Вход — SearchGPT{% endblock %}
+{% block content %}
+<main class="auth-page">
+  <div class="auth-card">
+    <a class="logo-big logo-auth" href="/" aria-hidden="true">
+      <span class="g">S</span><span class="e">e</span><span class="o">a</span><span class="r">r</span><span class="c">c</span><span class="h">h</span><span class="ai-badge">GPT</span>
+    </a>
+    <h1 class="auth-title">Вход в аккаунт</h1>
+    <p class="auth-sub muted">Войдите, чтобы пользоваться поиском и ответами ИИ.</p>
+
+    {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+
+    <form method="post" action="/login" class="auth-form" novalidate>
+      <input type="hidden" name="next" value="{{ next }}">
+      <label class="auth-field">
+        <span>Логин или e-mail</span>
+        <input type="text" name="login" autocomplete="username" required autofocus>
+      </label>
+      <label class="auth-field">
+        <span>Пароль</span>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="btn-primary">Войти</button>
+    </form>
+
+    {{ google_btn | safe }}
+
+    <p class="auth-switch muted">Нет аккаунта? <a href="/register{{ '?next=' + next if next != '/' else '' }}">Создать аккаунт →</a></p>
+  </div>
+</main>
+{% endblock %}

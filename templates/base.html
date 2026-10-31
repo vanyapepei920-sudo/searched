@@ -51,14 +51,14 @@
         <div class="dropdown" id="userDropdown">
           <div class="dd-head">
             {% if user.picture %}<img src="{{ user.picture }}" class="avatar big" alt="">{% endif %}
-            <div><b>{{ user.name }}</b><br><span class="muted">{{ user.email }}</span></div>
+            <div><b>{{ user.name }}</b><br><span class="muted">{{ user.email or 'Аккаунт SearchGPT' }}</span></div>
           </div>
           <a class="dd-item" href="/settings">⚙️ Настройки</a>
           <a class="dd-item" href="/auth/logout">Выйти</a>
         </div>
       </div>
     {% else %}
-      <a class="signin" href="/auth/login">Войти</a>
+      <a class="signin" href="/login">Войти</a>
     {% endif %}
   </div>
 </header>
@@ -82,14 +82,14 @@
         <div class="dropdown" id="userDropdown">
           <div class="dd-head">
             {% if user.picture %}<img src="{{ user.picture }}" class="avatar big" alt="">{% endif %}
-            <div><b>{{ user.name }}</b><br><span class="muted">{{ user.email }}</span></div>
+            <div><b>{{ user.name }}</b><br><span class="muted">{{ user.email or 'Аккаунт SearchGPT' }}</span></div>
           </div>
           <a class="dd-item" href="/settings">⚙️ Настройки</a>
           <a class="dd-item" href="/auth/logout">Выйти</a>
         </div>
       </div>
     {% else %}
-      <a class="signin" href="/auth/login">Войти</a>
+      <a class="signin" href="/login">Войти</a>
     {% endif %}
   </div>
 </header>

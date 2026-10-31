@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Регистрация — SearchGPT{% endblock %}
+{% block content %}
+<main class="auth-page">
+  <div class="auth-card">
+    <a class="logo-big logo-auth" href="/" aria-hidden="true">
+      <span class="g">S</span><span class="e">e</span><span class="o">a</span><span class="r">r</span><span class="c">c</span><span class="h">h</span><span class="ai-badge">GPT</span>
+    </a>
+    <h1 class="auth-title">Создать аккаунт</h1>
+    <p class="auth-sub muted">Регистрация занимает меньше минуты — поиск и ИИ-ответы станут доступны сразу.</p>
+
+    {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+
+    <form method="post" action="/register" class="auth-form" novalidate>
+      <input type="hidden" name="next" value="{{ next }}">
+      <label class="auth-field">
+        <span>Имя пользователя</span>
+        <input type="text" name="username" value="{{ values.username }}" autocomplete="username"
+               required minlength="3" maxlength="30" pattern="[A-Za-z0-9._-]{3,30}">
+      </label>
+      <label class="auth-field">
+        <span>E-mail (необязательно)</span>
+        <input type="email" name="email" value="{{ values.email }}" autocomplete="email">
+      </label>
+      <label class="auth-field">
+        <span>Пароль</span>
+        <input type="password" name="password" autocomplete="new-password" required minlength="6">
+      </label>
+      <label class="auth-field">
+        <span>Повторите пароль</span>
+        <input type="password" name="password2" autocomplete="new-password" required minlength="6">
+      </label>
+      <button type="submit" class="btn-primary">Зарегистрироваться</button>
+    </form>
+
+    {{ google_btn | safe }}
+
+    <p class="auth-switch muted">Уже есть аккаунт? <a href="/login{{ '?next=' + next if next != '/' else '' }}">Войти →</a></p>
+  </div>
+</main>
+{% endblock %}
