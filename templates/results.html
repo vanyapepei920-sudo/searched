@@ -10,15 +10,15 @@
     <div class="stats muted">Найдено примерно: {{ '{:,}'.format(results.total) }} результатов за {{ results.searchTime }} с.</div>
 
     {% if ai %}
-      <section class="ai-card">
+      <section class="ai-card" data-sound="{{ '1' if st.sound else '0' }}">
         <div class="ai-head">
           <span class="ai-spark">✦</span> Ответ ИИ
-          <span class="muted small">· на основе результатов поиска</span>
+          <span class="muted small">· модель {{ st.ai_model }} · на основе результатов поиска</span>
         </div>
         <p class="ai-text">{{ ai }}</p>
         <div class="ai-sources">
           {% for it in results['items'][:4] %}
-            <a href="{{ it.link }}" target="_blank" rel="noopener" class="src-chip" title="{{ it.title }}">{{ loop.index }}. {{ it.displayLink }}</a>
+            <a href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %} class="src-chip" title="{{ it.title }}">{{ loop.index }}. {{ it.displayLink }}</a>
           {% endfor %}
         </div>
       </section>
@@ -39,7 +39,7 @@
             <div class="r-url">{{ it.link|truncate(70, true) }}</div>
           </div>
         </div>
-        <a class="r-title" href="{{ it.link }}" target="_blank" rel="noopener">{{ it.title }}</a>
+        <a class="r-title" href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %}>{{ it.title }}</a>
         {% if it.thumbnail %}<img class="r-thumb" src="{{ it.thumbnail }}" alt="" loading="lazy">{% endif %}
         <div class="r-snippet">{{ it.snippet }}</div>
       </li>

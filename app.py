@@ -5,20 +5,21 @@ SearchGPT — собственный поисковик на базе Google Cus
 Возможности:
   * Поиск через Google CSE (GOOGLE_API_KEY + GOOGLE_CX_ID)
   * Обязательный вход через Google-аккаунт (OAuth 2.0) для веб-интерфейса
+    — реализован на чистом requests, БЕЗ authlib (Termux-friendly)
   * Публичный REST API (/api/v1/search) с ключами доступа (403 без ключа)
   * AI-ответ поверх выдачи через Pollinations.AI (бесплатно, без ключа)
+  * Страница «Настройки» со всеми опциями интерфейса
   * Тёмная / светлая тема, интерфейс в стиле Google
 
-Работает на Termux:  pip install -r requirements.txt && python app.py
+Работает на Termux:  pkg install python && pip install -r requirements.txt && python app.py
 """
 
 import json
 import os
 import secrets
-from urllib.parse import quote_plus
+from urllib.parse import urlencode
 
 import requests
-from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -26,6 +27,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    Response,
     session,
     url_for,
 )
@@ -33,7 +35,7 @@ from flask import (
 load_dotenv()
 
 # ----------------------------------------------------------------------------
-# Конфигурация
+# Конфигурация из .env
 # ----------------------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 GOOGLE_CX_ID = os.getenv("GOOGLE_CX_ID", "").strip()
@@ -46,10 +48,12 @@ SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_hex(32)
 # ИИ-ответ генерируется через Pollinations.AI — бесплатный OpenAI-совместимый
 # API (https://github.com/pollinations/pollinations), ключ не требуется.
 POLLINATIONS_URL = os.getenv(
-    "POLLINATIONS_URL", "https://text.pollinations.ai/openai"
+    "POLLINATIONS_URL", "https://text.pollinations.ai"
 ).strip().rstrip("/")
 POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "openai").strip()
-AI_ENABLED = os.getenv("AI_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+AI_ENABLED_DEFAULT = os.getenv("AI_ENABLED", "1").strip().lower() not in (
+    "0", "false", "off", "no",
+)
 
 PORT = int(os.getenv("PORT", "4000"))
 
@@ -61,6 +65,76 @@ CSE_URL = "https://www.googleapis.com/customsearch/v1"
 NUM_RESULTS = 10
 
 # ----------------------------------------------------------------------------
+# Настройки пользователя (страница /settings): сохраняются в cookie браузера,
+# поэтому работают без БД и переживают перезагрузку сервера.
+# ----------------------------------------------------------------------------
+SETTINGS_DEFAULTS = {
+    "theme": "dark",                    # dark | light
+    "results_per_page": 10,             # 5 | 10 | 20
+    "safe_search": True,                # фильтрация нежелательного контента
+    "ai_enabled": AI_ENABLED_DEFAULT,   # показывать блок «Ответ ИИ»
+    "ai_model": POLLINATIONS_MODEL,     # модель Pollinations
+    "language": "ru",                   # ru | en | ua | es | de
+    "new_tab": True,                    # открывать результаты в новой вкладке
+    "instant_answers": True,            # мгновенные ответы ИИ прямо на главной
+    "sound": False,                     # звук при ответе ИИ
+    "autosuggest": True,                # подсказки в строке поиска
+}
+
+VALID_MODELS = ["openai", "mistral", "llama", "deepseek", "searchgpt"]
+VALID_LANGS = {"ru": "Русский", "en": "English", "ua": "Українська", "es": "Español", "de": "Deutsch"}
+VALID_RPP = [5, 10, 20]
+
+COOKIE_NAME = "sgpt_settings"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+
+
+def get_settings() -> dict:
+    """Читает настройки из cookie и дополняет значениями по умолчанию."""
+    s = dict(SETTINGS_DEFAULTS)
+    raw = request.cookies.get(COOKIE_NAME)
+    if raw:
+        try:
+            loaded = json.loads(raw)
+        except Exception:
+            # Браузер мог прислать URL-encoded значение (мы его так и ставим)
+            try:
+                from urllib.parse import unquote
+                loaded = json.loads(unquote(raw))
+            except Exception:
+                loaded = None
+        if isinstance(loaded, dict):
+            s.update(loaded)
+    # Валидация
+    if s["theme"] not in ("dark", "light"):
+        s["theme"] = "dark"
+    try:
+        s["results_per_page"] = int(s["results_per_page"])
+    except Exception:
+        s["results_per_page"] = 10
+    if s["results_per_page"] not in VALID_RPP:
+        s["results_per_page"] = 10
+    for b in ("safe_search", "ai_enabled", "new_tab", "instant_answers", "sound", "autosuggest"):
+        s[b] = bool(s[b])
+    if s["language"] not in VALID_LANGS:
+        s["language"] = "ru"
+    if s["ai_model"] not in VALID_MODELS:
+        s["ai_model"] = POLLINATIONS_MODEL
+    return s
+
+
+def settings_response(resp: Response, settings: dict) -> Response:
+    resp.set_cookie(
+        COOKIE_NAME,
+        json.dumps(settings),
+        max_age=COOKIE_MAX_AGE,
+        httponly=False,  # читаем из JS для мгновенной смены темы
+        samesite="Lax",
+    )
+    return resp
+
+
+# ----------------------------------------------------------------------------
 # Приложение
 # ----------------------------------------------------------------------------
 app = Flask(__name__)
@@ -68,22 +142,82 @@ app.secret_key = SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["PREFERRED_URL_SCHEME"] = "http"
 
-oauth = OAuth(app)
-if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
-    oauth.register(
-        name="google",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-        client_kwargs={"scope": "openid email profile"},
-    )
+
+@app.context_processor
+def inject_globals():
+    """Достаёт настройки текущего пользователя во всех шаблонах."""
+    try:
+        st = get_settings()
+    except Exception:
+        st = dict(SETTINGS_DEFAULTS)
+    return {
+        "st": st,
+        "lang_name": VALID_LANGS.get(st["language"], "Русский"),
+    }
 
 
 # ----------------------------------------------------------------------------
-# Вспомогательные функции
+# Google OAuth 2.0 на чистом requests (без authlib — никаких нативных
+# зависимостей, все пакеты ставятся чистым pip, работает на Termux)
 # ----------------------------------------------------------------------------
-def google_search(query: str, page: int = 1, num: int = NUM_RESULTS):
-    """Запрос к Google Custom Search API. Возвращает dict или None."""
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+
+def build_google_auth_url(state: str) -> str:
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": url_for("callback", _external=True),
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "select_account",
+        "state": state,
+    }
+    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+
+
+def google_exchange_code(code: str):
+    """Обменивает authorization code на access token."""
+    try:
+        r = requests.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": url_for("callback", _external=True),
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except requests.RequestException:
+        return None
+
+
+def google_userinfo(access_token: str):
+    try:
+        r = requests.get(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except requests.RequestException:
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Вспомогательные функции поиска / ИИ
+# ----------------------------------------------------------------------------
+def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool = True):
+    """Запрос к Google Custom Search API. Возвращает dict или {'error': ...}."""
     if not (GOOGLE_API_KEY and GOOGLE_CX_ID):
         return {"error": "GOOGLE_API_KEY / GOOGLE_CX_ID не настроены в .env"}
     try:
@@ -95,6 +229,7 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS):
                 "q": query,
                 "num": min(num, 10),
                 "start": max(page, 1) * num - num + 1,
+                **({"safe": "active"} if safe else {}),
             },
             timeout=15,
         )
@@ -107,15 +242,17 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS):
         data = r.json()
         items = []
         for it in data.get("items", []):
+            pagemap = it.get("pagemap", {}) or {}
+            thumb = None
+            if pagemap.get("cse_thumbnail"):
+                thumb = pagemap["cse_thumbnail"][0].get("src")
             items.append(
                 {
                     "title": it.get("title", ""),
                     "link": it.get("link", ""),
                     "snippet": it.get("snippet", ""),
                     "displayLink": it.get("displayLink", ""),
-                    "thumbnail": (it.get("pagemap", {}) or {}).get("cse_thumbnail", [{}])[0].get("src")
-                    if it.get("pagemap") and it.get("pagemap", {}).get("cse_thumbnail")
-                    else None,
+                    "thumbnail": thumb,
                 }
             )
         qi = data.get("searchInformation", {})
@@ -130,19 +267,16 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS):
         return {"error": f"Сеть недоступна: {e}"}
 
 
-def ai_answer(query: str, results: list) -> str | None:
+def ai_answer(query: str, results: list, model=None):
     """Генерирует краткий ИИ-ответ через Pollinations.AI (бесплатно, без ключа).
 
     Модель получает фрагменты результатов поиска и отвечает на их основе.
-    Pollinations предоставляет OpenAI-совместимый эндпоинт /v1/chat/completions.
     """
-    if not AI_ENABLED:
+    if not AI_ENABLED_DEFAULT:
         return None
     context_lines = []
     for i, it in enumerate(results[:8], 1):
-        context_lines.append(
-            f"[{i}] {it['title']} — {it['link']}\n{it['snippet']}"
-        )
+        context_lines.append(f"[{i}] {it['title']} — {it['link']}\n{it['snippet']}")
     context = "\n\n".join(context_lines) or "(нет результатов)"
     messages = [
         {
@@ -165,7 +299,7 @@ def ai_answer(query: str, results: list) -> str | None:
             f"{POLLINATIONS_URL}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
             json={
-                "model": POLLINATIONS_MODEL,
+                "model": model or POLLINATIONS_MODEL,
                 "messages": messages,
                 "temperature": 0.3,
                 "max_tokens": 700,
@@ -233,17 +367,22 @@ def login():
                 "и укажите Redirect URI: <code>http://localhost:4000/auth/callback</code>."
             ),
         )
-    redirect_uri = url_for("callback", _external=True)
-    return oauth.google.authorize_redirect(redirect_uri)
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    return redirect(build_google_auth_url(state))
 
 
 @app.route("/auth/callback")
 def callback():
-    try:
-        token = oauth.google.authorize_access_token()
-        userinfo = token.get("userinfo") or oauth.google.get("userinfo").json()
-    except Exception:
+    if request.args.get("state") != session.get("oauth_state"):
         return redirect(url_for("login"))
+    code = request.args.get("code", "")
+    if not code:
+        return redirect(url_for("login"))
+    tokens = google_exchange_code(code)
+    if not tokens or "access_token" not in tokens:
+        return redirect(url_for("login"))
+    userinfo = google_userinfo(tokens["access_token"]) or {}
     session["user"] = {
         "name": userinfo.get("name", "Пользователь"),
         "email": userinfo.get("email", ""),
@@ -263,12 +402,20 @@ def logout():
 # ----------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template("index.html", user=session.get("user"),
-                           query="", results=None, error=None, ai=None, page=1)
+    return render_template(
+        "index.html",
+        user=session.get("user"),
+        query="",
+        results=None,
+        error=None,
+        ai=None,
+        page=1,
+    )
 
 
 @app.route("/search")
 def search_page():
+    st = get_settings()
     query = request.args.get("q", "").strip()
     try:
         page = max(int(request.args.get("page", 1)), 1)
@@ -277,12 +424,13 @@ def search_page():
 
     results, error, ai = None, None, None
     if query:
-        data = google_search(query, page=page)
+        data = google_search(query, page=page, num=st["results_per_page"], safe=st["safe_search"])
         if "error" in data:
             error = data["error"]
         else:
             results = data
-            ai = ai_answer(query, results["items"])
+            if st["ai_enabled"]:
+                ai = ai_answer(query, results["items"], model=st["ai_model"])
 
     return render_template(
         "results.html",
@@ -292,7 +440,58 @@ def search_page():
         error=error,
         ai=ai,
         page=page,
-        ai_enabled=AI_ENABLED,
+        ai_enabled=st["ai_enabled"],
+    )
+
+
+@app.route("/lucky")
+def lucky():
+    """«Мне повезёт» — редирект на первый результат поиска."""
+    query = request.args.get("q", "").strip()
+    if not query:
+        return redirect(url_for("index"))
+    st = get_settings()
+    data = google_search(query, num=st["results_per_page"], safe=st["safe_search"])
+    items = data.get("items", [])
+    if items:
+        return redirect(items[0]["link"])
+    return redirect(url_for("search_page", q=query))
+
+
+# ----------------------------------------------------------------------------
+# Настройки
+# ----------------------------------------------------------------------------
+@app.route("/settings", methods=["GET", "POST"])
+def settings_page():
+    st = get_settings()
+    saved = False
+    if request.method == "POST":
+        new = dict(st)
+        new["theme"] = request.form.get("theme", st["theme"])
+        new["language"] = request.form.get("language", st["language"])
+        new["ai_model"] = request.form.get("ai_model", st["ai_model"])
+        try:
+            new["results_per_page"] = int(
+                request.form.get("results_per_page", st["results_per_page"])
+            )
+        except Exception:
+            pass
+        for b in ("safe_search", "ai_enabled", "new_tab", "instant_answers", "sound", "autosuggest"):
+            new[b] = request.form.get(b) == "on"
+        resp = redirect(url_for("settings_page", saved=1))
+        return settings_response(resp, new)
+
+    if request.args.get("saved") == "1":
+        saved = True
+
+    return render_template(
+        "settings.html",
+        user=session.get("user"),
+        st=st,
+        saved=saved,
+        valid_models=VALID_MODELS,
+        valid_langs=VALID_LANGS,
+        valid_rpp=VALID_RPP,
     )
 
 
@@ -356,8 +555,11 @@ def api_answer():
     answer = ai_answer(query, items)
     sources = [{"title": i["title"], "url": i["link"]} for i in items[:8]]
     if answer is None:
-        return jsonify({"answer": None, "sources": sources,
-                        "detail": "ИИ-ответ отключён (AI_ENABLED=0) или Pollinations недоступен"}), 200
+        return jsonify({
+            "answer": None,
+            "sources": sources,
+            "detail": "ИИ-ответ отключён (AI_ENABLED=0) или Pollinations недоступен",
+        }), 200
     return jsonify({"answer": answer, "sources": sources})
 
 
@@ -373,10 +575,25 @@ def api_models():
                 {"id": "search-google", "object": "model",
                  "owned_by": "self", "description": "Поиск через Google CSE"},
                 {"id": "search-ai", "object": "model",
-                 "owned_by": "self", "description": "Поиск + ИИ-ответ"},
+                 "owned_by": "self", "description": "Поиск + ИИ-ответ (Pollinations)"},
             ],
         }
     )
+
+
+@app.route("/api/v1/instant")
+def api_instant():
+    """Лёгкий эндпоинт для мгновенного ответа ИИ на главной (для залогиненных)."""
+    if not session.get("user") or not get_settings()["instant_answers"]:
+        return jsonify({"answer": None}), 200
+    query = request.args.get("q", "").strip()
+    if len(query) < 4:
+        return jsonify({"answer": None}), 200
+    data = google_search(query, num=5)
+    items = data.get("items", []) if "error" not in data else []
+    st = get_settings()
+    answer = ai_answer(query, items, model=st["ai_model"]) if st["ai_enabled"] else None
+    return jsonify({"answer": answer})
 
 
 @app.route("/health")
@@ -387,7 +604,7 @@ def health():
             "cse_configured": bool(GOOGLE_API_KEY and GOOGLE_CX_ID),
             "oauth_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
             "ai_provider": "pollinations.ai",
-            "ai_configured": AI_ENABLED,
+            "ai_configured": AI_ENABLED_DEFAULT,
             "api_keys_loaded": len(SEARCH_API_KEYS),
         }
     )

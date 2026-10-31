@@ -14,6 +14,9 @@
     <span class="mic" title="Голосовой поиск недоступен в API-версии">
       <svg viewBox="0 0 24 24" width="22" height="22"><path fill="#4285F4" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path fill="#EA4335" d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
     </span>
+    {% if st.autosuggest %}
+    <div class="suggest" id="suggest" hidden></div>
+    {% endif %}
   </form>
 
   <div class="buttons">
@@ -21,7 +24,14 @@
     <button class="gbtn" type="button" id="luckyBtn">Мне повезёт! 🍀</button>
   </div>
 
-  <p class="hint muted">Страница результатов также показывает краткий ответ от ИИ со ссылками на источники.</p>
+  {% if st.instant_answers and st.ai_enabled %}
+  <div class="instant-box" id="instantBox" hidden>
+    <div class="ai-head"><span class="ai-spark">✦</span> Мгновенный ответ ИИ</div>
+    <p class="ai-text" id="instantText"></p>
+  </div>
+  {% endif %}
+
+  <p class="hint muted">Страница результатов также показывает краткий ответ от ИИ со ссылками на источники. <a href="/settings">Настройки ⚙️</a></p>
 </main>
 {% endblock %}
 {% block scripts %}
@@ -31,8 +41,49 @@
   q.addEventListener('input', () => clearBtn.hidden = !q.value);
   clearBtn.addEventListener('click', () => { q.value=''; clearBtn.hidden=true; q.focus(); });
   document.getElementById('luckyBtn').addEventListener('click', () => {
-    if (q.value.trim()) location.href = '/search?q=' + encodeURIComponent(q.value) + '&lucky=1';
+    if (q.value.trim()) location.href = '/lucky?q=' + encodeURIComponent(q.value);
     else q.focus();
   });
+
+  // ---- Подсказки (по истории локальных поисков) ----
+  {% if st.autosuggest %}
+  const suggest = document.getElementById('suggest');
+  function getHistory(){ try { return JSON.parse(localStorage.getItem('sgpt_history')||'[]'); } catch(e){ return []; } }
+  function pushHistory(s){
+    let h = getHistory().filter(x => x !== s);
+    h.unshift(s); localStorage.setItem('sgpt_history', JSON.stringify(h.slice(0,10)));
+  }
+  document.getElementById('homeForm').addEventListener('submit', () => { if (q.value.trim()) pushHistory(q.value.trim()); });
+  q.addEventListener('input', () => {
+    const v = q.value.trim().toLowerCase();
+    if (!v) { suggest.hidden = true; return; }
+    const items = getHistory().filter(h => h.toLowerCase().includes(v) && h.toLowerCase() !== v).slice(0,5);
+    if (!items.length) { suggest.hidden = true; return; }
+    suggest.innerHTML = items.map(h => '<div class="sug-item">'+h.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('');
+    suggest.hidden = false;
+    suggest.querySelectorAll('.sug-item').forEach(el => el.addEventListener('mousedown', () => { q.value = el.textContent; suggest.hidden = true; }));
+  });
+  q.addEventListener('blur', () => setTimeout(() => suggest.hidden = true, 150));
+  {% endif %}
+
+  // ---- Мгновенный ответ ИИ на главной ----
+  {% if st.instant_answers and st.ai_enabled %}
+  const iBox = document.getElementById('instantBox'), iText = document.getElementById('instantText');
+  let iTimer = null;
+  q.addEventListener('input', () => {
+    clearTimeout(iTimer);
+    const v = q.value.trim();
+    if (v.length < 4) { iBox.hidden = true; return; }
+    iTimer = setTimeout(async () => {
+      iBox.hidden = false; iText.textContent = '✦ Думаю…';
+      try {
+        const r = await fetch('/api/v1/instant?q=' + encodeURIComponent(v));
+        const d = await r.json();
+        if (d.answer) { iText.textContent = d.answer; if ('{{ "1" if st.sound else "0" }}' === '1') playDing(); }
+        else iBox.hidden = true;
+      } catch(e) { iBox.hidden = true; }
+    }, 700);
+  });
+  {% endif %}
 </script>
 {% endblock %}

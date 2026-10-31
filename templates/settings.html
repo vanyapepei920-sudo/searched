@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}Настройки — SearchGPT{% endblock %}
+{% block content %}
+<main class="settings-wrap">
+  <h1 class="settings-title">⚙️ Настройки SearchGPT</h1>
+
+  {% if saved %}
+    <div class="saved-toast" id="savedToast">✅ Настройки сохранены</div>
+  {% endif %}
+
+  <form method="post" action="/settings" class="settings-form" id="settingsForm">
+
+    <section class="set-card">
+      <h2>Внешний вид</h2>
+
+      <label class="set-row">
+        <span class="set-label">Тема оформления</span>
+        <select name="theme" id="themeSel">
+          <option value="dark"  {% if st.theme=='dark' %}selected{% endif %}>🌙 Тёмная</option>
+          <option value="light" {% if st.theme=='light' %}selected{% endif %}>☀️ Светлая</option>
+        </select>
+      </label>
+
+      <label class="set-row">
+        <span class="set-label">Язык интерфейса</span>
+        <select name="language">
+          {% for code, name in valid_langs.items() %}
+            <option value="{{ code }}" {% if st.language==code %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label class="set-row">
+        <span class="set-label">Результатов на странице</span>
+        <select name="results_per_page">
+          {% for n in valid_rpp %}
+            <option value="{{ n }}" {% if st.results_per_page==n %}selected{% endif %}>{{ n }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </section>
+
+    <section class="set-card">
+      <h2>ИИ-ответ (Pollinations.AI)</h2>
+
+      <label class="set-row toggle-row">
+        <span class="set-label">Показывать «Ответ ИИ» над результатами</span>
+        <label class="switch">
+          <input type="checkbox" name="ai_enabled" {% if st.ai_enabled %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </label>
+
+      <label class="set-row">
+        <span class="set-label">Модель ИИ</span>
+        <select name="ai_model">
+          {% for m in valid_models %}
+            <option value="{{ m }}" {% if st.ai_model==m %}selected{% endif %}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label class="set-row toggle-row">
+        <span class="set-label">Мгновенные ответы ИИ прямо на главной</span>
+        <label class="switch">
+          <input type="checkbox" name="instant_answers" {% if st.instant_answers %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </label>
+
+      <label class="set-row toggle-row">
+        <span class="set-label">Звук при появлении ответа ИИ</span>
+        <label class="switch">
+          <input type="checkbox" name="sound" {% if st.sound %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </label>
+    </section>
+
+    <section class="set-card">
+      <h2>Поиск</h2>
+
+      <label class="set-row toggle-row">
+        <span class="set-label">Безопасный поиск (фильтрация нежелательного контента)</span>
+        <label class="switch">
+          <input type="checkbox" name="safe_search" {% if st.safe_search %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </label>
+
+      <label class="set-row toggle-row">
+        <span class="set-label">Открывать результаты в новой вкладке</span>
+        <label class="switch">
+          <input type="checkbox" name="new_tab" {% if st.new_tab %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </label>
+
+      <label class="set-row toggle-row">
+        <span class="set-label">Подсказки в строке поиска</span>
+        <label class="switch">
+          <input type="checkbox" name="autosuggest" {% if st.autosuggest %}checked{% endif %}>
+          <span class="slider"></span>
+        </label>
+      </label>
+    </section>
+
+    <div class="set-actions">
+      <button type="submit" class="gbtn primary">Сохранить настройки</button>
+      <a href="/" class="gbtn">← К поиску</a>
+    </div>
+  </form>
+
+  <p class="muted small note">
+    Настройки хранятся в cookie вашего браузера и применяются сразу после сохранения.
+    Секреты (API-ключи Google, CX, ключи доступа) задаются только в файле <code>.env</code>.
+  </p>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>
+  // Мгновенное применение темы из селекта без сохранения формы
+  const sel = document.getElementById('themeSel');
+  sel.addEventListener('change', () => {
+    document.documentElement.setAttribute('data-theme', sel.value);
+    localStorage.setItem('theme', sel.value);
+  });
+  {% if saved %}
+    setTimeout(() => { const t = document.getElementById('savedToast'); if (t) t.remove(); }, 3000);
+  {% endif %}
+</script>
+{% endblock %}
