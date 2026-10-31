@@ -45,6 +45,31 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_hex(32)
 
+# Публичный адрес приложения для OAuth redirect_uri.
+# Нужен, когда сайт открыт не напрямую с localhost:4000 (например через
+# ngrok / cloudflared / свой домен или по IP локальной сети): Google сверяет
+# redirect_uri строго посимвольно и выдаёт "Error 400: redirect_uri_mismatch",
+# если в консоли Cloud указан другой адрес.
+#   PUBLIC_BASE_URL=https://abc123.ngrok-free.app
+# Если оставить пустым — адрес вычисляется автоматически из запроса.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+
+def oauth_redirect_uri() -> str:
+    """redirect_uri, который реально уходит в Google (и должен быть в консоли)."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL + "/auth/callback"
+    # авто-определение: учитываем X-Forwarded-Proto/Host от прокси (ngrok и т.п.)
+    fwd_host = request.headers.get("X-Forwarded-Host")
+    if fwd_host:
+        scheme = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
+        return f"{scheme}://{fwd_host}/auth/callback"
+    try:
+        return url_for("callback", _external=True)
+    except RuntimeError:
+        base = request.url_root.rstrip("/")
+        return base + "/auth/callback"
+
 # ИИ-ответ генерируется через Pollinations.AI — бесплатный OpenAI-совместимый
 # API (https://github.com/pollinations/pollinations), ключ не требуется.
 POLLINATIONS_URL = os.getenv(
@@ -168,7 +193,7 @@ GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 def build_google_auth_url(state: str) -> str:
     params = {
         "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": url_for("callback", _external=True),
+        "redirect_uri": oauth_redirect_uri(),
         "response_type": "code",
         "scope": "openid email profile",
         "access_type": "offline",
@@ -188,11 +213,12 @@ def google_exchange_code(code: str):
                 "client_secret": GOOGLE_CLIENT_SECRET,
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": url_for("callback", _external=True),
+                "redirect_uri": oauth_redirect_uri(),
             },
             timeout=15,
         )
         if r.status_code != 200:
+            app.logger.error("OAuth token exchange failed: %s", r.text)
             return None
         return r.json()
     except requests.RequestException:
@@ -338,6 +364,7 @@ def require_google_login():
         "/auth/login",
         "/auth/callback",
         "/auth/logout",
+        "/auth/redirect-uri",  # диагностика redirect_uri_mismatch
         "/api/",              # REST API защищён отдельными ключами
         "/static/",
         "/favicon.ico",
@@ -372,16 +399,66 @@ def login():
     return redirect(build_google_auth_url(state))
 
 
+@app.route("/auth/redirect-uri")
+def redirect_uri_info():
+    """Показывает redirect_uri, который приложение отправляет в Google.
+    Откройте эту страницу в браузере и скопируйте адрес в Google Cloud Console."""
+    uri = oauth_redirect_uri()
+    return render_template(
+        "error.html",
+        title="Ваш OAuth Redirect URI",
+        detail=(
+            f"Откройте <b>Google Cloud Console → API и сервисы → Учётные данные → "
+            f"OAuth 2.0 клиент «Веб-приложение»</b> и добавьте этот адрес в поле "
+            f"<b>«Авторизованные URI перенаправления»</b> (сохраните):<br><br>"
+            f"<code style='font-size:16px'>{uri}</code><br><br>"
+            f"Затем подождите 1–2 минуты (консоль обновляет настройки не мгновенно) "
+            f"и войдите заново: <a href='/auth/login'>/auth/login</a>.<br><br>"
+            f"Если вы открываете сайт через ngrok/cloudflared или по IP — добавьте "
+            f"в консоль ровно тот адрес, по которому заходите в браузер."
+        ),
+    )
+
+
 @app.route("/auth/callback")
 def callback():
     if request.args.get("state") != session.get("oauth_state"):
         return redirect(url_for("login"))
+    error = request.args.get("error", "")
+    if error == "redirect_uri_mismatch":
+        return render_template(
+            "error.html",
+            title="Ошибка входа: redirect_uri_mismatch",
+            detail=(
+                "Google отклонил redirect_uri приложения.<br><br>"
+                "Перейдите на <a href='/auth/redirect-uri'>/auth/redirect-uri</a>, "
+                "скопируйте показанный адрес и добавьте его в Google Cloud Console "
+                "в раздел «URI перенаправления» вашего OAuth-клиента."
+            ),
+        )
     code = request.args.get("code", "")
     if not code:
-        return redirect(url_for("login"))
+        detail = "Получен ответ Google без кода авторизации."
+        if error:
+            detail += f" Код ошибки: <code>{error}</code>"
+        return render_template(
+            "error.html",
+            title="Не удалось войти через Google",
+            detail=detail + "<br><br>Попробуйте ещё раз: <a href='/auth/login'>/auth/login</a>",
+        )
     tokens = google_exchange_code(code)
     if not tokens or "access_token" not in tokens:
-        return redirect(url_for("login"))
+        return render_template(
+            "error.html",
+            title="Не удалось обменять код на токен",
+            detail=(
+                "Google не выдал access token. Частые причины:<br>"
+                "• в .env указан неверный GOOGLE_CLIENT_SECRET;<br>"
+                "• redirect_uri при обмене отличается от того, что был при авторизации "
+                "(проверьте <a href='/auth/redirect-uri'>/auth/redirect-uri</a>);<br>"
+                "• код уже использован (обновите страницу входа)."
+            ),
+        )
     userinfo = google_userinfo(tokens["access_token"]) or {}
     session["user"] = {
         "name": userinfo.get("name", "Пользователь"),
@@ -501,6 +578,8 @@ def settings_page():
         valid_models=VALID_MODELS,
         valid_langs=VALID_LANGS,
         valid_rpp=VALID_RPP,
+        redirect_uri=oauth_redirect_uri(),
+        oauth_configured=bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
     )
 
 
@@ -607,11 +686,20 @@ def api_instant():
 
 @app.route("/health")
 def health():
+    # redirect_uri считаем вручную (вне request-контекста url_for недоступен)
+    if PUBLIC_BASE_URL:
+        uri = PUBLIC_BASE_URL + "/auth/callback"
+    else:
+        try:
+            uri = url_for("callback", _external=True)
+        except RuntimeError:
+            uri = f"http://localhost:{PORT}/auth/callback"
     return jsonify(
         {
             "status": "ok",
             "cse_configured": bool(GOOGLE_API_KEY and GOOGLE_CX_ID),
             "oauth_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+            "redirect_uri": uri,
             "ai_provider": "pollinations.ai",
             "ai_configured": AI_ENABLED_DEFAULT,
             "api_keys_loaded": len(SEARCH_API_KEYS),

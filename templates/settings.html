@@ -115,6 +115,22 @@
     Настройки хранятся в cookie вашего браузера и применяются сразу после сохранения.
     Секреты (API-ключи Google, CX, ключи доступа) задаются только в файле <code>.env</code>.
   </p>
+
+  <section class="card">
+    <h2>🔐 Аккаунт и вход через Google</h2>
+    {% if oauth_configured %}
+      <p class="muted small">OAuth-клиент настроен (.env). Чтобы вход работал без ошибки
+        <code>redirect_uri_mismatch</code>, добавьте адрес ниже в Google Cloud Console →
+        «URI перенаправления» вашего клиента:</p>
+      <p><code id="ruri">{{ redirect_uri }}</code>
+        <button type="button" class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('ruri').innerText);this.textContent='✓ Скопировано'">Копировать</button></p>
+      <p class="muted small">Совет: добавьте также варианты с <code>127.0.0.1</code> вместо <code>localhost</code> —
+        Google считает их разными адресами. После сохранения в консоли подождите 1–2 минуты.</p>
+    {% else %}
+      <p class="muted small">В <code>.env</code> не заданы <code>GOOGLE_CLIENT_ID</code> /
+        <code>GOOGLE_CLIENT_SECRET</code> — вход через Google недоступен.</p>
+    {% endif %}
+  </section>
 </main>
 {% endblock %}
 {% block scripts %}

@@ -252,3 +252,16 @@ a { color:var(--blue); text-decoration:none; }
 .gf-links { display:flex; gap:26px; padding:12px 24px; flex-wrap:wrap; }
 .gf-links a { color:var(--text2); font-size:14px; }
 .gf-links a:hover { text-decoration:underline; }
+
+/* Кнопка копирования redirect_uri в настройках */
+.btn-copy {
+  margin-left: 8px;
+  padding: 4px 12px;
+  border: 1px solid var(--border, #dadce0);
+  border-radius: 16px;
+  background: transparent;
+  color: var(--accent, #1a73e8);
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-copy:hover { background: rgba(26, 115, 232, 0.08); }
