@@ -1,72 +1,111 @@
 {% extends "base.html" %}
 {% block title %}{{ query }} — SearchGPT{% endblock %}
 {% block content %}
-<main class="results-wrap">
-  {% if error %}
-    <div class="alert">⚠️ {{ error }}</div>
-  {% endif %}
+<nav class="g-tabs">
+  <a class="tab active" href="/search?search={{ query|e }}">🔍 Все</a>
+  <a class="tab" href="/images?q={{ query|e }}" onclick="return false;">🖼️ Картинки</a>
+  <a class="tab" href="#" onclick="return false;">📰 Новости</a>
+  <a class="tab" href="#" onclick="return false;">🎥 Видео</a>
+  <a class="tab" href="#" onclick="return false;">🗺️ Карты</a>
+  <span class="tab-spacer"></span>
+  <a class="tab tab-settings" href="/settings">⚙️ Настройки</a>
+</nav>
 
-  {% if results and results.items %}
-    <div class="stats muted">Найдено примерно: {{ '{:,}'.format(results.total) }} результатов за {{ results.searchTime }} с.</div>
-
-    {% if ai %}
-      <section class="ai-card" data-sound="{{ '1' if st.sound else '0' }}">
-        <div class="ai-head">
-          <span class="ai-spark">✦</span> Ответ ИИ
-          <span class="muted small">· модель {{ st.ai_model }} · на основе результатов поиска</span>
-        </div>
-        <p class="ai-text">{{ ai }}</p>
-        <div class="ai-sources">
-          {% for it in results['items'][:4] %}
-            <a href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %} class="src-chip" title="{{ it.title }}">{{ loop.index }}. {{ it.displayLink }}</a>
-          {% endfor %}
-        </div>
-      </section>
-    {% elif ai_enabled %}
-      <div class="ai-loading" id="aiLoading">✦ ИИ готовит ответ…</div>
+<main class="results-layout">
+  <div class="results-main">
+    {% if error %}
+      <div class="alert">⚠️ {{ error }}</div>
     {% endif %}
 
-    <ol class="organic">
-      {% for it in results['items'] %}
-      <li class="result">
-        <div class="r-top">
-          <div class="r-favicon">
-            <img src="https://www.google.com/s2/favicons?domain={{ it.displayLink }}&sz=32" alt="" loading="lazy"
-                 onerror="this.style.display='none'">
+    {% if results and results.items %}
+      <div class="stats muted">Примерно {{ '{:,}'.format(results.total) }} результатов ({{ results.searchTime }} с.)</div>
+
+      {% if ai %}
+        <section class="ai-card" data-sound="{{ '1' if st.sound else '0' }}">
+          <div class="ai-head">
+            <span class="ai-spark">✦</span> Ответ ИИ
+            <span class="muted small">· модель {{ st.ai_model }} · на основе результатов поиска</span>
           </div>
-          <div class="r-meta">
-            <div class="r-site">{{ it.displayLink }}</div>
-            <div class="r-url">{{ it.link|truncate(70, true) }}</div>
+          <p class="ai-text">{{ ai }}</p>
+          <div class="ai-sources">
+            {% for it in results['items'][:4] %}
+              <a href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %} class="src-chip" title="{{ it.title }}">{{ loop.index }}. {{ it.displayLink }}</a>
+            {% endfor %}
+          </div>
+        </section>
+      {% elif ai_enabled %}
+        <div class="ai-loading" id="aiLoading">✦ ИИ готовит ответ…</div>
+      {% endif %}
+
+      <ol class="organic">
+        {% for it in results['items'] %}
+        <li class="result">
+          <div class="r-top">
+            <div class="r-favicon">
+              <img src="https://www.google.com/s2/favicons?domain={{ it.displayLink }}&sz=32" alt="" loading="lazy"
+                   onerror="this.style.display='none'">
+            </div>
+            <div class="r-meta">
+              <div class="r-site">{{ it.displayLink }}</div>
+              <div class="r-url">{{ it.link|truncate(70, true) }}</div>
+            </div>
+          </div>
+          <a class="r-title" href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %}>{{ it.title }}</a>
+          {% if it.thumbnail %}<img class="r-thumb" src="{{ it.thumbnail }}" alt="" loading="lazy">{% endif %}
+          <div class="r-snippet">{{ it.snippet }}</div>
+        </li>
+        {% endfor %}
+      </ol>
+
+      <nav class="gnav">
+        {% if page > 1 %}
+          <a class="gbtn-page" href="/search?search={{ query|e }}&page={{ page-1 }}">← Назад</a>
+        {% endif %}
+        <div class="pages-row">
+          <span class="sgpt-g">S</span><span class="g-blue">e</span><span class="g-red">a</span><span class="g-blue">r</span><span class="g-green">c</span><span class="g-red">h</span><span class="g-blue">G</span><span class="g-green">P</span><span class="g-red">T</span>
+          <div class="page-nums">
+            {% for p in range(page, [page + 9, (results.total // results_per_page_num) + 1] | min) %}
+              {% if p == page %}<b>{{ p }}</b>{% else %}<a href="/search?search={{ query|e }}&page={{ p }}">{{ p }}</a>{% endif %}
+            {% endfor %}
           </div>
         </div>
-        <a class="r-title" href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %}>{{ it.title }}</a>
-        {% if it.thumbnail %}<img class="r-thumb" src="{{ it.thumbnail }}" alt="" loading="lazy">{% endif %}
-        <div class="r-snippet">{{ it.snippet }}</div>
-      </li>
-      {% endfor %}
-    </ol>
+        {% if results.hasMore %}
+          <a class="gbtn-page" href="/search?search={{ query|e }}&page={{ page+1 }}">Вперёд →</a>
+        {% endif %}
+      </nav>
 
-    <nav class="pager">
-      {% if page > 1 %}
-        <a href="/search?q={{ query|e }}&page={{ page-1 }}">← Назад</a>
-      {% endif %}
-      <span class="pages">
-        {% for p in range(1, [ (results.total // 10) + 1, 11 ] | min) %}
-          {% if p == page %}<b>{{ p }}</b>{% else %}<a href="/search?q={{ query|e }}&page={{ p }}">{{ p }}</a>{% endif %}
+    {% elif query and not error %}
+      <div class="empty">
+        <h2>Ничего не нашлось по запросу «{{ query }}»</h2>
+        <p class="muted">Попробуйте другие ключевые слова или более общий запрос.</p>
+      </div>
+    {% else %}
+      <div class="empty muted">Введите запрос в строке выше.</div>
+    {% endif %}
+  </div>
+
+  {% if results and results.items %}
+  <aside class="knowledge-panel">
+    <div class="kp-card">
+      <div class="kp-title">✦ Об этом запросе</div>
+      <p class="muted small">ИИ-ответ и {{ results['items']|length }} источников в выдаче. Ссылки слева ведут на сайты из поиска Google Custom Search.</p>
+      <div class="kp-links">
+        {% for it in results['items'][:3] %}
+          <a href="{{ it.link }}" {% if st.new_tab %}target="_blank" rel="noopener"{% endif %}>{{ it.displayLink }}</a>
         {% endfor %}
-      </span>
-      {% if results.hasMore %}
-        <a href="/search?q={{ query|e }}&page={{ page+1 }}">Вперёд →</a>
-      {% endif %}
-    </nav>
-
-  {% elif query and not error %}
-    <div class="empty">
-      <h2>Ничего не нашлось по запросу «{{ query }}»</h2>
-      <p class="muted">Попробуйте другие ключевые слова или более общий запрос.</p>
+      </div>
     </div>
-  {% else %}
-    <div class="empty muted">Введите запрос в строке выше.</div>
+  </aside>
   {% endif %}
 </main>
+
+<footer class="g-footer">
+  <div class="gf-top muted">Россия</div>
+  <div class="gf-links">
+    <a href="/settings">Настройки</a>
+    <a href="https://policies.google.com" target="_blank" rel="noopener">Конфиденциальность</a>
+    <a href="https://policies.google.com/terms" target="_blank" rel="noopener">Условия</a>
+    <a href="#">Отправить отзыв</a>
+  </div>
+</footer>
 {% endblock %}

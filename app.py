@@ -414,9 +414,15 @@ def index():
 
 
 @app.route("/search")
-def search_page():
+@app.route("/search?<path:query>")  # Google-стиль: /search?=Запрос и /search?Запрос
+def search_page(query=None):
     st = get_settings()
-    query = request.args.get("q", "").strip()
+    # приоритет: ?search=Запрос > путь после «?» (/search?Запрос) > обычный ?q=
+    query = (
+        request.args.get("search")
+        or query
+        or request.args.get("q", "")
+    ).strip()
     try:
         page = max(int(request.args.get("page", 1)), 1)
     except ValueError:
@@ -441,13 +447,16 @@ def search_page():
         ai=ai,
         page=page,
         ai_enabled=st["ai_enabled"],
+        results_per_page_num=st["results_per_page"],
+        on_results=True,
     )
 
 
 @app.route("/lucky")
-def lucky():
+@app.route("/lucky?<path:query>")  # Google-стиль: /lucky?=Запрос
+def lucky(query=None):
     """«Мне повезёт» — редирект на первый результат поиска."""
-    query = request.args.get("q", "").strip()
+    query = (request.args.get("search") or query or request.args.get("q", "")).strip()
     if not query:
         return redirect(url_for("index"))
     st = get_settings()

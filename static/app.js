@@ -39,3 +39,12 @@ function playDing(){
   } catch(e){}
 }
 document.querySelectorAll('.ai-card[data-sound="1"]').forEach(() => playDing());
+
+// ---- Кнопка «Очистить» в строке поиска на странице результатов ----
+const topInput = document.querySelector('.searchbox-top input[name="search"]');
+const clearTopBtn = document.getElementById('clearTopBtn');
+if (topInput && clearTopBtn) {
+  const upd = () => clearTopBtn.hidden = !topInput.value;
+  topInput.addEventListener('input', upd); upd();
+  clearTopBtn.addEventListener('click', () => { topInput.value=''; clearTopBtn.hidden=true; topInput.focus(); });
+}
