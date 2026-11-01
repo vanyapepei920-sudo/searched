@@ -254,13 +254,22 @@ def _short_err(e) -> str:
 
 
 def cse_api_diag(api_key: str):
-    """Диагностика по Cloud Billing API: список проектов с включённым
-    Custom Search JSON API для данного ключа. Возвращает (status, текст),
-    где status: 'ok' | 'not_enabled' | 'no_projects' | 'invalid_key' | 'net_error'.
+    """Диагностика доступа ключа к Custom Search JSON API — БЕЗ Cloud Billing API.
 
-    Это точный ответ на ошибку «This project does not have the access to
-    Custom Search JSON API»: она означает, что проект, которому принадлежит
-    КЛЮЧ, не имеет включённого API (даже если вы включили его в другом проекте).
+    Раньше здесь дёргался cloudbilling.googleapis.com, который возвращал
+    бесполезную ошибку 403 («requests to this api cloudbilling ... are blocked»)
+    и пугал пользователя. Теперь проверка идёт напрямую тем же эндпоинтом,
+    которым реально пользуется поиск: один тестовый запрос q="test", num=1.
+
+    Возвращает (status, текст), status:
+      'ok'          — ключ имеет доступ к API;
+      'invalid_key' — ключ недействителен / удалён;
+      'not_enabled' — API не включён в ПРОЕКТЕ КЛЮЧА (частая причина ошибки
+                      «does not have the access to Custom Search JSON API»);
+      'ip_blocked'  — ключ ограничен списком IP/рефереров;
+      'quota'       — исчертана дневная квота;
+      'net_error'   — сеть/TLS недоступны;
+      'other'       — прочее (текст Google приложен).
     """
     if not api_key:
         return ("no_key", "GOOGLE_API_KEY не задан")
@@ -271,34 +280,30 @@ def cse_api_diag(api_key: str):
         return hit[1]
     result = None
     try:
-        r = _http.get(
-            "https://cloudbilling.googleapis.com/v1/services",
-            params={"key": api_key, "pageSize": 300},
-            timeout=15,
-        )
-        if r.status_code == 400 or r.status_code == 403:
-            msg = ""
-            try:
-                msg = r.json().get("error", {}).get("message", "").lower()
-            except Exception:
-                pass
-            if "api key" in msg and ("not valid" in msg or "invalid" in msg):
-                result = ("invalid_key", "API-ключ недействителен (проверьте значение)")
-            else:
-                result = ("no_projects", "Не удалось получить список проектов (403): " + msg[:150])
+        r = _http.get(CSE_URL, params={"key": api_key, "q": "test", "num": 1},
+                      timeout=15, hosts=CSE_FALLBACK_HOSTS)
+        body = ""
+        try:
+            body = (r.json().get("error", {}) or {}).get("message", "") or ""
+        except Exception:
+            body = (r.text or "")[:200]
+        low = (body + " " + str(r.status_code)).lower()
+        if r.status_code == 200:
+            result = ("ok", "Ключ имеет доступ к Custom Search JSON API")
+        elif "api key not valid" in low or "invalid" in low and "api key" in low:
+            result = ("invalid_key", "API-ключ недействителен (проверьте значение в .env)")
+        elif "access not configured" in low or "does not have the access" in low \
+                or "have not been used" in low or "custom search json api" in low and "disabled" in low:
+            result = ("not_enabled",
+                      "В проекте этого API-ключа Custom Search JSON API НЕ включён")
+        elif "ip referer" in low or "permission denied on resource project" in low \
+                and "apikeyservice" in low:
+            result = ("ip_blocked",
+                      "Ключ ограничен списком IP/HTTP-рефереров в Cloud Console")
+        elif "quota" in low or "limit" in low:
+            result = ("quota", "Превышена квота API (бесплатно 100 запросов/день)")
         elif r.status_code != 200:
-            result = ("no_projects", f"Cloud Billing API: HTTP {r.status_code}")
-        else:
-            found = []
-            for s in r.json().get("billingServices", []):
-                if s.get("displayName") == "Custom Search API" or \
-                        s.get("name", "").endswith("/customsearch"):
-                    found.append(s.get("serviceId", "customsearch.googleapis.com"))
-            if found:
-                result = ("ok", "Custom Search JSON API включён в проекте ключа")
-            else:
-                result = ("not_enabled",
-                          "В проекте этого API-ключа Custom Search JSON API НЕ включён")
+            result = ("other", f"Google вернул HTTP {r.status_code}: {body[:150]}")
     except requests.RequestException as e:
         result = ("net_error", "Сеть недоступна: " + _short_err(e))
     CSE_DIAG_CACHE[ck] = (now, result)
@@ -444,6 +449,17 @@ def init_db():
                  provider TEXT DEFAULT 'local',
                  picture TEXT DEFAULT '',
                  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        # Ключи админ-панели (создаются в /admin, работают как Bearer-токены)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS admin_keys (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL,
+                 key_hash TEXT UNIQUE NOT NULL,
+                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                 expires_at INTEGER DEFAULT 0,
+                 revoked INTEGER DEFAULT 0
                )"""
         )
 
@@ -1026,7 +1042,8 @@ PUBLIC_PATHS = (
     "/auth/redirect-uri",  # диагностика redirect_uri_mismatch
     "/login",
     "/register",
-    "/api/",              # REST API защищён отдельными ключами
+    "/admin",              # защищено собственным паролем/ключом (см. ADMIN_PASSWORD)
+    "/api/",               # REST API защищён отдельными ключами
     "/static/",
     "/favicon.ico",
     "/health",
@@ -1684,6 +1701,475 @@ def health():
             "network_google_reachable": net_ok(),
         }
     )
+
+
+# ----------------------------------------------------------------------------
+# Админ-панель /admin (пароль ADMIN_PASSWORD, по умолчанию 37212)
+#   * онлайн-редактор файлов проекта (для .py — проверка синтаксиса, бэкапы),
+#   * «ключи редактирования» sgpt-admin-... — REST-доступ к файлам команды,
+#   * диагностика Google API / сети / ИИ, перезапуск процесса, пользователи.
+# Авторизация: подписанная cookie sgpt_admin (7 дней) ИЛИ заголовок
+#   Authorization: Bearer sgpt-admin-... / X-API-Key (см. вкладку «Ключи API»).
+# ----------------------------------------------------------------------------
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "37212").strip() or "37212"
+ADMIN_COOKIE = "sgpt_admin"
+ADMIN_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+BACKUP_DIR = os.path.join(PROJECT_ROOT, "backups")
+ADMIN_HIDDEN_DIRS = {".git", "__pycache__", "backups", "node_modules", ".venv"}
+ADMIN_PROTECTED_FILES = {"users.db", ".env"}  # чтение/запись запрещены
+
+
+def _sign(value: str) -> str:
+    return hmac.new(SECRET_KEY.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+
+def admin_cookie_value() -> str:
+    exp = int(time.time()) + ADMIN_COOKIE_MAX_AGE
+    payload = f"{exp}"
+    return f"{payload}.{_sign(payload)}"
+
+
+def admin_session_ok() -> bool:
+    raw = request.cookies.get(ADMIN_COOKIE, "")
+    if "." not in raw:
+        return False
+    payload, sig = raw.rsplit(".", 1)
+    if not hmac.compare_digest(_sign(payload), sig):
+        return False
+    try:
+        return int(payload) > time.time()
+    except ValueError:
+        return False
+
+
+def make_admin_key(name: str, days: int = 30):
+    """Создаёт ключ редактирования. Возвращает (полный_ключ, id). В БД — только хэш."""
+    token = "sgpt-admin-" + secrets.token_urlsafe(32)
+    kh = hashlib.sha256(token.encode()).hexdigest()
+    exp = int(time.time()) + max(1, days) * 86400
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO admin_keys (name, key_hash, expires_at) VALUES (?,?,?)",
+            (name.strip()[:60] or "key", kh, exp),
+        )
+        return token, cur.lastrowid
+
+
+def admin_key_from_request() -> bool:
+    auth = request.headers.get("Authorization", "")
+    tok = ""
+    if auth.lower().startswith("bearer "):
+        tok = auth[7:].strip()
+    if not tok:
+        tok = request.headers.get("X-API-Key", "").strip()
+    if not tok.startswith("sgpt-admin-"):
+        return False
+    kh = hashlib.sha256(tok.encode()).hexdigest()
+    row = db().execute(
+        "SELECT id FROM admin_keys WHERE key_hash=? AND revoked=0 AND "
+        "(expires_at=0 OR expires_at>?)", (kh, int(time.time()))
+    ).fetchone()
+    return bool(row)
+
+
+def is_admin() -> bool:
+    return admin_session_ok() or admin_key_from_request()
+
+
+def require_admin():
+    if is_admin():
+        return None
+    if request.path.startswith("/admin/api/"):
+        return jsonify({"error": "unauthorized",
+                        "hint": "Нужен заголовок Authorization: Bearer sgpt-admin-..."}), 403
+    return None  # страницы покажет форму входа по паролю
+
+
+def safe_project_path(rel: str):
+    """Относит путь к корню проекта; выход за пределы и защита файлов — ValueError."""
+    rel = (rel or "").replace("\\", "/").lstrip("/")
+    full = os.path.abspath(os.path.join(PROJECT_ROOT, rel))
+    if full != PROJECT_ROOT and not full.startswith(PROJECT_ROOT + os.sep):
+        raise ValueError("Путь вне проекта")
+    parts = rel.split("/")
+    if any(p in ADMIN_HIDDEN_DIRS for p in parts[:-1]) or parts[0] in ADMIN_HIDDEN_DIRS:
+        raise ValueError("Системная папка недоступна")
+    if os.path.basename(full) in ADMIN_PROTECTED_FILES or rel in ADMIN_PROTECTED_FILES:
+        raise ValueError("Этот файл защищён от просмотра/изменения")
+    return full
+
+
+def admin_file_tree():
+    out = []
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        dirs[:] = sorted(d for d in dirs if d not in ADMIN_HIDDEN_DIRS
+                         and not d.startswith(".git"))
+        rel_root = os.path.relpath(root, PROJECT_ROOT).replace("\\", "/")
+        if rel_root == ".":
+            rel_root = ""
+        for f in sorted(files):
+            if f in ADMIN_PROTECTED_FILES or f.endswith((".pyc", ".db", ".log")):
+                continue
+            p = os.path.join(rel_root, f) if rel_root else f
+            try:
+                size = os.path.getsize(os.path.join(root, f))
+            except OSError:
+                size = 0
+            out.append({"path": p, "size": size})
+    return out
+
+
+ADMIN_HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Админ-панель — SearchGPT</title>
+<style>
+:root{--bg:#0f1116;--card:#171a21;--tx:#e8eaed;--mut:#9aa0a6;--acc:#8ab4f8;--ok:#34a853;--bad:#ea4335;--bd:#2a2e37}
+@media(prefers-color-scheme:light){:root{--bg:#fff;--card:#f7f8fa;--tx:#202124;--mut:#5f6368;--acc:#1a73e8;--bd:#dadce0}}
+*{box-sizing:border-box}body{margin:0;font-family:Roboto,Arial,sans-serif;background:var(--bg);color:var(--tx)}
+header{display:flex;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--bd)}
+header b{font-size:18px}.logo{color:var(--acc)}nav{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+nav button{background:none;border:1px solid var(--bd);color:var(--tx);padding:7px 14px;border-radius:20px;cursor:pointer}
+nav button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+main{padding:18px;max-width:1200px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
+input,textarea,select{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:9px;font-size:14px;width:100%}
+textarea{font-family:monospace;min-height:420px;white-space:pre;tab-size:2}
+button.act{background:var(--acc);color:#fff;border:0;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
+button.danger{background:var(--bad)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.grid{display:grid;grid-template-columns:260px 1fr;gap:14px}
+@media(max-width:800px){.grid{grid-template-columns:1fr}}
+ul.files{list-style:none;padding:0;margin:0;max-height:520px;overflow:auto}
+ul.files li a{display:block;color:var(--tx);text-decoration:none;padding:6px 9px;border-radius:7px;font-size:13px}
+ul.files li a:hover,ul.files li a.on{background:var(--acc);color:#fff}
+.msg{padding:10px 12px;border-radius:8px;margin:8px 0;font-size:14px}
+.msg.ok{background:rgba(52,168,83,.15);border:1px solid var(--ok)}
+.msg.err{background:rgba(234,67,53,.15);border:1px solid var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px;border-bottom:1px solid var(--bd);text-align:left}
+code.k{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:12px;word-break:break-all}
+.badge{padding:2px 8px;border-radius:10px;font-size:12px;background:var(--bd)}
+.hide{display:none}
+</style></head><body>
+<header><span class="logo"><b>Search</b>GPT</b></span> <b>· админ-панель</b>
+<nav id="tabs" class="hide">
+<button data-t="files" class="on">📁 Файлы</button>
+<button data-t="keys">🔑 Ключи API</button>
+<button data-t="diag">🩺 Диагностика</button>
+<button data-t="users">👥 Пользователи</button>
+<button id="logout">Выйти</button></nav></header>
+<main>
+<div id="loginCard" class="card hide">
+  <h2>Вход в админ-панель</h2>
+  <div class="row"><input id="pw" type="password" placeholder="Пароль" style="max-width:300px"></div>
+  <div class="row"><button class="act" onclick="login()">Войти</button><span id="loginMsg"></span></div>
+</div>
+
+<div id="tab-files" class="tab">
+  <div class="grid">
+    <div class="card"><h3>Проект</h3><ul class="files" id="fileList"></ul></div>
+    <div class="card">
+      <div class="row"><b id="curPath">— выберите файл —</b></div>
+      <textarea id="editor" spellcheck="false"></textarea>
+      <div class="row">
+        <button class="act" onclick="saveFile()">💾 Сохранить</button>
+        <button class="act" onclick="newFile()">✨ Новый файл</button>
+        <span id="fileMsg"></span></div>
+    </div>
+  </div>
+</div>
+
+<div id="tab-keys" class="tab hide">
+  <div class="card"><h3>Создать ключ редактирования</h3>
+    <div class="row"><input id="keyName" placeholder="Название (например: qwen-agent)" style="max-width:300px">
+    <select id="keyDays" style="max-width:140px"><option value="7">7 дней</option><option value="30" selected>30 дней</option><option value="90">90 дней</option></select>
+    <button class="act" onclick="createKey()">Создать</button></div>
+    <div id="newKeyBox" class="msg ok hide">Скопируйте ключ (он показывается один раз):<br><code class="k" id="newKeyVal"></code>
+      <div class="row" style="margin-top:8px"><button class="act" onclick="copyKey()">📋 Копировать</button></div></div>
+    <p style="color:var(--mut);font-size:13px">Ключ даёт доступ к файлам сайта через API:<br>
+    <code class="k">GET /admin/api/list</code> · <code class="k">GET /admin/api/file?path=app.py</code> ·
+    <code class="k">POST /admin/api/write {"path","content"}</code> · <code class="k">POST /admin/api/delete</code> ·
+    <code class="k">POST /admin/api/restart</code><br>Авторизация: заголовок <code class="k">Authorization: Bearer sgpt-admin-...</code> (или X-API-Key). Без ключа — 403.</p>
+  </div>
+  <div class="card"><h3>Активные ключи</h3><table id="keyTable"></table></div>
+</div>
+
+<div id="tab-diag" class="tab hide">
+  <div class="card"><h3>Состояние сервиса</h3><div id="diagBox">…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="act" onclick="loadDiag()">🔄 Обновить</button>
+      <button class="act danger" onclick="restartApp()">♻️ Перезапустить сервер</button>
+      <span id="diagMsg"></span></div></div>
+</div>
+
+<div id="tab-users" class="tab hide"><div class="card"><h3>Пользователи</h3><table id="userTable"></table></div></div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+async function api(path,opt={}){
+  opt.headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});
+  const r=await fetch(path,opt);
+  let j=null;try{j=await r.json()}catch(e){}
+  if(r.status===401||r.status===403&&!j?.items){$('#tabs').classList.add('hide');$('#loginCard').classList.remove('hide')}
+  return {status:r.status,data:j};
+}
+function setMsg(sel,text,ok=true){$(sel).innerHTML=`<span class="msg ${ok?'ok':'err'}">${text}</span>`}
+async function login(){
+  const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:$('#pw').value})});
+  if(r.ok){$('#loginCard').classList.add('hide');$('#tabs').classList.remove('hide');loadFiles()}
+  else setMsg('#loginMsg','Неверный пароль',false);
+}
+$('#logout')&&$('#logout').onclick=async()=>{await fetch('/admin/logout',{method:'POST'});location.reload()};
+document.querySelectorAll('#tabs button[data-t]').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#tabs button[data-t]').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.add('hide'));$('#tab-'+b.dataset.t).classList.remove('hide');
+  if(b.dataset.t==='keys')loadKeys();if(b.dataset.t==='diag')loadDiag();if(b.dataset.t==='users')loadUsers();
+});
+let CUR='';
+async function loadFiles(){
+  const {data}=await api('/admin/api/list');if(!data)return;
+  $('#fileList').innerHTML=(data.files||[]).map(f=>
+    `<li><a href="#" data-p="${f.path}" onclick="openFile('${f.path}');return false">${f.path} <small style="color:var(--mut)">${f.size}B</small></a></li>`).join('');
+}
+async function openFile(p){
+  CUR=p;document.querySelectorAll('#fileList a').forEach(a=>a.classList.toggle('on',a.dataset.p===p));
+  const {data}=await api('/admin/api/file?path='+encodeURIComponent(p));
+  if(data){$('#curPath').textContent=p;$('#editor').value=data.content||''}else setMsg('#fileMsg','Ошибка чтения',false);
+}
+async function saveFile(){
+  if(!CUR)return setMsg('#fileMsg','Сначала выберите файл',false);
+  const {status,data}=await api('/admin/api/write',{method:'POST',body:JSON.stringify({path:CUR,content:$('#editor').value})});
+  setMsg('#fileMsg',status===200?('✅ '+ (data?.message||'сохранено')):(data?.error||'ошибка'),status===200);
+}
+async function newFile(){
+  const p=prompt('Путь нового файла (например templates/about.html)');if(!p)return;
+  const {status,data}=await api('/admin/api/write',{method:'POST',body:JSON.stringify({path:p,content:''})});
+  if(status===200){loadFiles();openFile(p)}else alert(data?.error||'ошибка');
+}
+async function createKey(){
+  const {status,data}=await api('/admin/api/keys/create',{method:'POST',
+    body:JSON.stringify({name:$('#keyName').value||'key',days:+$('#keyDays').value})});
+  if(status===200){$('#newKeyVal').textContent=data.key;$('#newKeyBox').classList.remove('hide');loadKeys()}
+  else alert(data?.error||'ошибка');
+}
+function copyKey(){navigator.clipboard.writeText($('#newKeyVal').textContent)}
+async function loadKeys(){
+  const {data}=await api('/admin/api/keys');if(!data)return;
+  $('#keyTable').innerHTML='<tr><th>Имя</th><th>Создан</th><th>Действует до</th><th></th></tr>'+
+   (data.keys||[]).map(k=>`<tr><td>${k.name}</td><td>${k.created_at}</td><td>${k.expires}</td>
+   <td><button class="act danger" style="padding:4px 10px" onclick="revokeKey(${k.id})">Отозвать</button></td></tr>`).join('');
+}
+async function revokeKey(id){await api('/admin/api/keys/revoke',{method:'POST',body:JSON.stringify({id})});loadKeys()}
+async function loadDiag(){
+  const {data}=await api('/admin/api/diag');if(!data)return;
+  $('#diagBox').innerHTML=Object.entries(data).map(([k,v])=>`<div class="row"><span class="badge">${k}</span> <b>${v}</b></div>`).join('');
+}
+async function restartApp(){
+  if(!confirm('Перезапустить Flask-процесс? Незалогиненные сессии сбросятся.'))return;
+  const {status,data}=await api('/admin/api/restart',{method:'POST'});
+  setMsg('#diagMsg',status===200?('✅ '+(data?.message||'перезапуск через 2 сек')):(data?.error||'ошибка'),status===200);
+}
+async function loadUsers(){
+  const {data}=await api('/admin/api/users');if(!data)return;
+  $('#userTable').innerHTML='<tr><th>ID</th><th>Логин</th><th>Email</th><th>Способ</th><th>Создан</th></tr>'+
+   (data.users||[]).map(u=>`<tr><td>${u.id}</td><td>${u.username}</td><td>${u.email||'—'}</td><td>${u.provider}</td><td>${u.created_at}</td></tr>`).join('');
+}
+(async()=>{const r=await api('/admin/api/list');if(r.data){$('#tabs').classList.remove('hide');loadFiles()}})();
+</script></body></html>"""
+
+
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    if is_admin():
+        return Response(ADMIN_HTML, mimetype="text/html")
+    return redirect(url_for("admin_login_page"))
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login_page():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        pw = str(data.get("password", request.form.get("password", "")))
+        if hmac.compare_digest(pw, ADMIN_PASSWORD):
+            resp = jsonify({"ok": True})
+            resp.set_cookie(ADMIN_COOKIE, admin_cookie_value(),
+                            max_age=ADMIN_COOKIE_MAX_AGE, httponly=True, samesite="Lax")
+            return resp
+        return jsonify({"error": "неверный пароль"}), 401
+    return Response(ADMIN_HTML, mimetype="text/html")
+
+
+@app.route("/admin/logout", methods=["POST"])
+def admin_logout():
+    resp = jsonify({"ok": True})
+    resp.delete_cookie(ADMIN_COOKIE)
+    return resp
+
+
+@app.route("/admin/api/list")
+def admin_api_list():
+    err = require_admin()
+    if err:
+        return err
+    return jsonify({"root": PROJECT_ROOT, "files": admin_file_tree()})
+
+
+@app.route("/admin/api/file")
+def admin_api_file():
+    err = require_admin()
+    if err:
+        return err
+    try:
+        full = safe_project_path(request.args.get("path", ""))
+        if not os.path.isfile(full):
+            return jsonify({"error": "файл не найден"}), 404
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            return jsonify({"path": request.args.get("path"), "content": f.read()})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 500
+
+
+@app.route("/admin/api/write", methods=["POST"])
+def admin_api_write():
+    err = require_admin()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    rel = str(data.get("path", ""))
+    content = str(data.get("content", ""))
+    try:
+        full = safe_project_path(rel)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
+    if rel.endswith(".py"):
+        import ast
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            return jsonify({"error": f"Синтаксис Python неверен: {e}"
+                                   f" (строка {e.lineno}). Файл НЕ сохранён."}), 400
+    if os.path.isfile(full):
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            import shutil
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(full, os.path.join(
+                BACKUP_DIR, stamp + "-" + rel.replace("/", "_")))
+        except Exception:
+            pass
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+    return jsonify({"ok": True, "message": f"Сохранён {rel}"})
+
+
+@app.route("/admin/api/delete", methods=["POST"])
+def admin_api_delete():
+    err = require_admin()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        full = safe_project_path(str(data.get("path", "")))
+        if os.path.isfile(full):
+            os.remove(full)
+            return jsonify({"ok": True})
+        return jsonify({"error": "файл не найден"}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
+
+
+@app.route("/admin/api/keys/create", methods=["POST"])
+def admin_api_keys_create():
+    err = require_admin()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    days = int(data.get("days", 30) or 30)
+    token, kid = make_admin_key(str(data.get("name", "key")), days)
+    return jsonify({"ok": True, "id": kid, "key": token})
+
+
+@app.route("/admin/api/keys")
+def admin_api_keys_list():
+    err = require_admin()
+    if err:
+        return err
+    rows = db().execute(
+        "SELECT id,name,created_at,expires_at,revoked FROM admin_keys ORDER BY id DESC LIMIT 100"
+    ).fetchall()
+    return jsonify({"keys": [{
+        "id": r["id"], "name": r["name"], "created_at": r["created_at"],
+        "expires": time.strftime("%Y-%m-%d", time.localtime(r["expires_at"])) if r["expires_at"] else "∞",
+        "revoked": bool(r["revoked"]),
+    } for r in rows if not r["revoked"]]})
+
+
+@app.route("/admin/api/keys/revoke", methods=["POST"])
+def admin_api_keys_revoke():
+    err = require_admin()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    with db() as conn:
+        conn.execute("UPDATE admin_keys SET revoked=1 WHERE id=?", (int(data.get("id", 0)),))
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/api/diag")
+def admin_api_diag():
+    err = require_admin()
+    if err:
+        return err
+    key = GOOGLE_API_KEY
+    cx = GOOGLE_CX_ID
+    st_status, st_text = cse_api_diag(key) if key else ("no_key", "GOOGLE_API_KEY не задан")
+    cx_ok, cx_msg = check_cx_alive(key, cx) if (key and cx) else (False, "cx не задан")
+    ai_ok = "?"
+    try:
+        r = _http.post(POLLINATIONS_URL.rstrip("/") + "/v1/chat/completions",
+                       json={"model": POLLINATIONS_MODEL,
+                             "messages": [{"role": "user", "content": "ping"}],
+                             "max_tokens": 5}, timeout=20)
+        ai_ok = "работает" if r.status_code == 200 else f"HTTP {r.status_code}"
+    except Exception as e:
+        ai_ok = "ошибка: " + _short_err(e)
+    return jsonify({
+        "google_network": "доступен" if net_ok() else "НЕДОСТУПЕН (TLS/сеть)",
+        "cse_api": f"{st_status}: {st_text}",
+        "search_system_cx": ("жива: " + cx_msg) if cx_ok else ("проблема: " + cx_msg),
+        "oauth_configured": "да" if (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET) else "нет",
+        "redirect_uri": oauth_redirect_uri(),
+        "ai_pollinations": ai_ok,
+        "api_keys_count": len(SEARCH_API_KEYS),
+    })
+
+
+@app.route("/admin/api/users")
+def admin_api_users():
+    err = require_admin()
+    if err:
+        return err
+    rows = db().execute(
+        "SELECT id,username,email,provider,created_at FROM users ORDER BY id DESC LIMIT 200"
+    ).fetchall()
+    return jsonify({"users": [dict(r) for r in rows]})
+
+
+@app.route("/admin/api/restart", methods=["POST"])
+def admin_api_restart():
+    err = require_admin()
+    if err:
+        return err
+    def _do():
+        time.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Thread(target=_do, daemon=True).start()
+    return jsonify({"ok": True, "message": "перезапуск процесса через 2 секунды"})
 
 
 if __name__ == "__main__":

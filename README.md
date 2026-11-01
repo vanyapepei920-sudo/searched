@@ -108,5 +108,25 @@ http://localhost:4000/search?search=Ваш+запрос
 http://localhost:4000/search?q=Ваш+запрос    # старый вариант тоже работает
 ```
 
+## Админ-панель (/admin)
+
+Откройте `http://localhost:4000/admin` и войдите по паролю (по умолчанию **37212**,
+задаётся переменной `ADMIN_PASSWORD` в `.env`). Возможности:
+
+* **📁 Файлы** — онлайн-редактор кода проекта (для .py — проверка синтаксиса, бэкапы в `backups/`);
+* **🔑 Ключи API** — создание «ключей редактирования» `sgpt-admin-...` для удалённого
+  управления файлами через REST (Bearer/X-API-Key; отзыв в любой момент);
+* **🩺 Диагностика** — статус Google CSE API, поисковой системы CX, сети, OAuth, Pollinations AI;
+* **♻️ Перезапуск** сервера одним кнопкой; **👥 Пользователи** — список аккаунтов.
+
+```bash
+curl -H "Authorization: Bearer sgpt-admin-XXXX" http://localhost:4000/admin/api/list
+curl -H "Authorization: Bearer sgpt-admin-XXXX" "http://localhost:4000/admin/api/file?path=app.py"
+curl -X POST -H "Authorization: Bearer sgpt-admin-XXXX" -H "Content-Type: application/json" \
+     -d '{"path":"static/x.txt","content":"hello"}' http://localhost:4000/admin/api/write
+```
+
+Без ключа все `/admin/api/*` отвечают **403**. Файлы `.env` и `users.db` закрыты от просмотра.
+
 ## Проверка конфигурации
 `GET /health` покажет, какие ключи заданы (без вывода самих ключей).
