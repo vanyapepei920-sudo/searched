@@ -1962,6 +1962,8 @@ def health():
         }
     )
 
+load_runtime_cfg()
+
 
 # ----------------------------------------------------------------------------
 # Админ-панель /admin (пароль ADMIN_PASSWORD, по умолчанию 37212)
@@ -2043,12 +2045,14 @@ def is_admin() -> bool:
 
 
 def require_admin():
+    """Возвращает ответ-заглушку, если доступа нет; None — если доступ есть."""
     if is_admin():
         return None
     if request.path.startswith("/admin/api/"):
         return jsonify({"error": "unauthorized",
-                        "hint": "Нужен заголовок Authorization: Bearer sgpt-admin-..."}), 403
-    return None  # страницы покажет форму входа по паролю
+                        "hint": "Нужен заголовок Authorization: Bearer sgpt-admin-... "
+                                "или cookie после входа в /admin"}), 403
+    return redirect(url_for("admin_login_page"))
 
 
 def safe_project_path(rel: str):
@@ -2095,6 +2099,9 @@ ADMIN_HTML = r"""<!doctype html>
 <style>
 :root{--bg:#0f1116;--card:#171a21;--tx:#e8eaed;--mut:#9aa0a6;--acc:#8ab4f8;--ok:#34a853;--bad:#ea4335;--bd:#2a2e37}
 @media(prefers-color-scheme:light){:root{--bg:#fff;--card:#f7f8fa;--tx:#202124;--mut:#5f6368;--acc:#1a73e8;--bd:#dadce0}}
+html[data-light] *{color-scheme:light}
+html[data-light]{--bg:#fff;--card:#f7f8fa;--tx:#202124;--mut:#5f6368;--acc:#1a73e8;--bd:#dadce0}
+html:not([data-light]){--bg:#0f1116;--card:#171a21;--tx:#e8eaed;--mut:#9aa0a6;--acc:#8ab4f8;--ok:#34a853;--bad:#ea4335;--bd:#2a2e37}
 *{box-sizing:border-box}body{margin:0;font-family:Roboto,Arial,sans-serif;background:var(--bg);color:var(--tx)}
 header{display:flex;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--bd)}
 header b{font-size:18px}.logo{color:var(--acc)}nav{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
@@ -2103,13 +2110,14 @@ nav button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
 main{padding:18px;max-width:1200px;margin:0 auto}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
 input,textarea,select{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:9px;font-size:14px;width:100%}
-textarea{font-family:monospace;min-height:420px;white-space:pre;tab-size:2}
+textarea#editor{font-family:ui-monospace,Menlo,Consolas,monospace;min-height:420px;white-space:pre;tab-size:2;resize:vertical;line-height:1.45}
 button.act{background:var(--acc);color:#fff;border:0;padding:9px 16px;border-radius:8px;cursor:pointer;font-size:14px}
 button.danger{background:var(--bad)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
 .grid{display:grid;grid-template-columns:260px 1fr;gap:14px}
 @media(max-width:800px){.grid{grid-template-columns:1fr}}
 ul.files{list-style:none;padding:0;margin:0;max-height:520px;overflow:auto}
+ul.files li.grp{padding:7px 9px 3px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);font-weight:700}
 ul.files li a{display:block;color:var(--tx);text-decoration:none;padding:6px 9px;border-radius:7px;font-size:13px}
 ul.files li a:hover,ul.files li a.on{background:var(--acc);color:#fff}
 .msg{padding:10px 12px;border-radius:8px;margin:8px 0;font-size:14px}
@@ -2119,21 +2127,19 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px;borde
 code.k{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:12px;word-break:break-all}
 .badge{padding:2px 8px;border-radius:10px;font-size:12px;background:var(--bd)}
 .hide{display:none}
+#loginWrap{display:flex;justify-content:center;padding-top:8vh}
+#loginCard{max-width:420px;width:100%}
 </style></head><body>
+<div id="app" class="hide">
 <header><span class="logo"><b>Search</b>GPT</b></span> <b>· админ-панель</b>
-<nav id="tabs" class="hide">
+<nav id="tabs">
 <button data-t="files" class="on">📁 Файлы</button>
 <button data-t="keys">🔑 Ключи API</button>
 <button data-t="diag">🩺 Диагностика</button>
 <button data-t="users">👥 Пользователи</button>
+<button id="themeBtn">🌙</button>
 <button id="logout">Выйти</button></nav></header>
 <main>
-<div id="loginCard" class="card hide">
-  <h2>Вход в админ-панель</h2>
-  <div class="row"><input id="pw" type="password" placeholder="Пароль" style="max-width:300px"></div>
-  <div class="row"><button class="act" onclick="login()">Войти</button><span id="loginMsg"></span></div>
-</div>
-
 <div id="tab-files" class="tab">
   <div class="grid">
     <div class="card"><h3>Проект</h3><ul class="files" id="fileList"></ul></div>
@@ -2143,6 +2149,7 @@ code.k{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:12px;wor
       <div class="row">
         <button class="act" onclick="saveFile()">💾 Сохранить</button>
         <button class="act" onclick="newFile()">✨ Новый файл</button>
+        <button class="act danger" onclick="delFile()">🗑 Удалить</button>
         <span id="fileMsg"></span></div>
     </div>
   </div>
@@ -2173,43 +2180,76 @@ code.k{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:12px;wor
 
 <div id="tab-users" class="tab hide"><div class="card"><h3>Пользователи</h3><table id="userTable"></table></div></div>
 </main>
+</div>
+
+<div id="loginWrap">
+<div id="loginCard" class="card">
+  <h2>🔐 Вход в админ-панель</h2>
+  <p style="color:var(--mut);font-size:13px">Введите пароль администратора (ADMIN_PASSWORD из .env).</p>
+  <div class="row"><input id="pw" type="password" placeholder="Пароль" style="max-width:300px" onkeydown="if(event.key==='Enter')login()"></div>
+  <div class="row"><button class="act" onclick="login()">Войти</button><span id="loginMsg"></span></div>
+</div>
+</div>
+
 <script>
 const $=s=>document.querySelector(s);
+let AUTHED=false;
+function showLogin(){$('#app').classList.add('hide');$('#loginWrap').classList.remove('hide')}
+function showApp(){AUTHED=true;$('#loginWrap').classList.add('hide');$('#app').classList.remove('hide')}
 async function api(path,opt={}){
   opt.headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});
   const r=await fetch(path,opt);
   let j=null;try{j=await r.json()}catch(e){}
-  if(r.status===401||r.status===403&&!j?.items){$('#tabs').classList.add('hide');$('#loginCard').classList.remove('hide')}
+  if((r.status===401||r.status===403)&&!path.includes('/api/list')){showLogin()}
   return {status:r.status,data:j};
 }
-function setMsg(sel,text,ok=true){$(sel).innerHTML=`<span class="msg ${ok?'ok':'err'}">${text}</span>`}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function setMsg(sel,text,ok=true){$(sel).innerHTML=`<span class="msg ${ok?'ok':'err'}">${esc(text)}</span>`}
 async function login(){
   const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({password:$('#pw').value})});
-  if(r.ok){$('#loginCard').classList.add('hide');$('#tabs').classList.remove('hide');loadFiles()}
+  if(r.ok){showApp();loadFiles()}
   else setMsg('#loginMsg','Неверный пароль',false);
 }
-$('#logout')&&$('#logout').onclick=async()=>{await fetch('/admin/logout',{method:'POST'});location.reload()};
+$('#logout').onclick=async()=>{await fetch('/admin/logout',{method:'POST'});location.reload()};
 document.querySelectorAll('#tabs button[data-t]').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('#tabs button[data-t]').forEach(x=>x.classList.remove('on'));b.classList.add('on');
   document.querySelectorAll('.tab').forEach(t=>t.classList.add('hide'));$('#tab-'+b.dataset.t).classList.remove('hide');
   if(b.dataset.t==='keys')loadKeys();if(b.dataset.t==='diag')loadDiag();if(b.dataset.t==='users')loadUsers();
 });
+$('#themeBtn').onclick=()=>{const d=document.documentElement.hasAttribute('data-light');
+  if(d){document.documentElement.removeAttribute('data-light');$('#themeBtn').textContent='🌙'}
+  else{document.documentElement.setAttribute('data-light','1');$('#themeBtn').textContent='☀️'}};
 let CUR='';
 async function loadFiles(){
-  const {data}=await api('/admin/api/list');if(!data)return;
-  $('#fileList').innerHTML=(data.files||[]).map(f=>
-    `<li><a href="#" data-p="${f.path}" onclick="openFile('${f.path}');return false">${f.path} <small style="color:var(--mut)">${f.size}B</small></a></li>`).join('');
+  const {data}=await api('/admin/api/list');if(!data||!data.files)return;
+  const groups={};
+  data.files.forEach(f=>{const g=f.path.includes('/')?f.path.split('/')[0]:'корень';(groups[g]=groups[g]||[]).push(f)});
+  let html='';
+  Object.keys(groups).sort().forEach(g=>{
+    html+=`<li class="grp">${esc(g)}</li>`;
+    groups[g].forEach(f=>{const nm=f.path.includes('/')?f.path.split('/').slice(1).join('/'):f.path;
+      html+=`<li><a href="#" data-p="${esc(f.path)}">${esc(nm)} <small style="color:var(--mut)">${f.size}B</small></a></li>`})});
+  $('#fileList').innerHTML=html;
+  $('#fileList').querySelectorAll('a').forEach(a=>a.onclick=e=>{e.preventDefault();openFile(a.dataset.p)});
 }
 async function openFile(p){
   CUR=p;document.querySelectorAll('#fileList a').forEach(a=>a.classList.toggle('on',a.dataset.p===p));
   const {data}=await api('/admin/api/file?path='+encodeURIComponent(p));
-  if(data){$('#curPath').textContent=p;$('#editor').value=data.content||''}else setMsg('#fileMsg','Ошибка чтения',false);
+  if(data&&typeof data.content==='string'){$('#curPath').textContent=p;$('#editor').value=data.content}
+  else setMsg('#fileMsg','Ошибка чтения файла',false);
 }
 async function saveFile(){
   if(!CUR)return setMsg('#fileMsg','Сначала выберите файл',false);
   const {status,data}=await api('/admin/api/write',{method:'POST',body:JSON.stringify({path:CUR,content:$('#editor').value})});
-  setMsg('#fileMsg',status===200?('✅ '+ (data?.message||'сохранено')):(data?.error||'ошибка'),status===200);
+  setMsg('#fileMsg',status===200?(data?.message||'сохранено'):(data?.error||'ошибка сохранения'),status===200);
+}
+async function delFile(){
+  if(!CUR)return setMsg('#fileMsg','Сначала выберите файл',false);
+  if(!confirm('Удалить '+CUR+'?'))return;
+  const {status,data}=await api('/admin/api/delete',{method:'POST',body:JSON.stringify({path:CUR})});
+  if(status===200){$('#editor').value='';$('#curPath').textContent='— файл удалён —';CUR='';loadFiles()}
+  else setMsg('#fileMsg',data?.error||'ошибка',false);
 }
 async function newFile(){
   const p=prompt('Путь нового файла (например templates/about.html)');if(!p)return;
@@ -2226,13 +2266,13 @@ function copyKey(){navigator.clipboard.writeText($('#newKeyVal').textContent)}
 async function loadKeys(){
   const {data}=await api('/admin/api/keys');if(!data)return;
   $('#keyTable').innerHTML='<tr><th>Имя</th><th>Создан</th><th>Действует до</th><th></th></tr>'+
-   (data.keys||[]).map(k=>`<tr><td>${k.name}</td><td>${k.created_at}</td><td>${k.expires}</td>
+   (data.keys||[]).map(k=>`<tr><td>${esc(k.name)}</td><td>${esc(k.created_at)}</td><td>${esc(k.expires)}</td>
    <td><button class="act danger" style="padding:4px 10px" onclick="revokeKey(${k.id})">Отозвать</button></td></tr>`).join('');
 }
 async function revokeKey(id){await api('/admin/api/keys/revoke',{method:'POST',body:JSON.stringify({id})});loadKeys()}
 async function loadDiag(){
   const {data}=await api('/admin/api/diag');if(!data)return;
-  $('#diagBox').innerHTML=Object.entries(data).map(([k,v])=>`<div class="row"><span class="badge">${k}</span> <b>${v}</b></div>`).join('');
+  $('#diagBox').innerHTML=Object.entries(data).map(([k,v])=>`<div class="row"><span class="badge">${esc(k)}</span> <b>${esc(v)}</b></div>`).join('');
 }
 async function restartApp(){
   if(!confirm('Перезапустить Flask-процесс? Незалогиненные сессии сбросятся.'))return;
@@ -2242,17 +2282,18 @@ async function restartApp(){
 async function loadUsers(){
   const {data}=await api('/admin/api/users');if(!data)return;
   $('#userTable').innerHTML='<tr><th>ID</th><th>Логин</th><th>Email</th><th>Способ</th><th>Создан</th></tr>'+
-   (data.users||[]).map(u=>`<tr><td>${u.id}</td><td>${u.username}</td><td>${u.email||'—'}</td><td>${u.provider}</td><td>${u.created_at}</td></tr>`).join('');
+   (data.users||[]).map(u=>`<tr><td>${u.id}</td><td>${esc(u.username)}</td><td>${esc(u.email||'—')}</td><td>${esc(u.provider)}</td><td>${esc(u.created_at)}</td></tr>`).join('');
 }
-(async()=>{const r=await api('/admin/api/list');if(r.data){$('#tabs').classList.remove('hide');loadFiles()}})();
+(async()=>{
+  const r=await fetch('/admin/api/list');
+  if(r.ok){showApp();loadFiles()}else{showLogin()}
+})();
 </script></body></html>"""
 
 
 @app.route("/admin", methods=["GET"])
 def admin_page():
-    if is_admin():
-        return Response(ADMIN_HTML, mimetype="text/html")
-    return redirect(url_for("admin_login_page"))
+    return Response(ADMIN_HTML, mimetype="text/html")
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
@@ -2262,8 +2303,10 @@ def admin_login_page():
         pw = str(data.get("password", request.form.get("password", "")))
         if hmac.compare_digest(pw, ADMIN_PASSWORD):
             resp = jsonify({"ok": True})
+            secure = request.headers.get("X-Forwarded-Proto", request.scheme) == "https"
             resp.set_cookie(ADMIN_COOKIE, admin_cookie_value(),
-                            max_age=ADMIN_COOKIE_MAX_AGE, httponly=True, samesite="Lax")
+                            max_age=ADMIN_COOKIE_MAX_AGE, httponly=True,
+                            samesite="None" if secure else "Lax", secure=secure)
             return resp
         return jsonify({"error": "неверный пароль"}), 401
     return Response(ADMIN_HTML, mimetype="text/html")
@@ -2438,10 +2481,6 @@ def admin_api_restart():
         os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=_do, daemon=True).start()
     return jsonify({"ok": True, "message": "перезапуск процесса через 2 секунды"})
-
-
-load_runtime_cfg()
-
 
 if __name__ == "__main__":
     print(f"🔎 SearchGPT запущен: http://localhost:{PORT}")
