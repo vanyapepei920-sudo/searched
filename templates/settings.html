@@ -191,18 +191,75 @@
 
   <section class="card">
     <h2>🔐 Аккаунт и вход через Google</h2>
+
+    <p class="muted small">Адрес, который приложение отправляет в Google прямо сейчас
+      (должен <b>символ в символ</b> совпадать с записью в Cloud Console):</p>
+    <p><code id="ruri">{{ redirect_uri }}</code>
+      <button type="button" class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('ruri').innerText);this.textContent='✓ Скопировано'">Копировать</button></p>
     {% if oauth_configured %}
-      <p class="muted small">OAuth-клиент настроен (.env). Чтобы вход работал без ошибки
-        <code>redirect_uri_mismatch</code>, добавьте адрес ниже в Google Cloud Console →
-        «URI перенаправления» вашего клиента:</p>
-      <p><code id="ruri">{{ redirect_uri }}</code>
-        <button type="button" class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('ruri').innerText);this.textContent='✓ Скопировано'">Копировать</button></p>
-      <p class="muted small">Совет: добавьте также варианты с <code>127.0.0.1</code> вместо <code>localhost</code> —
-        Google считает их разными адресами. После сохранения в консоли подождите 1–2 минуты.</p>
+      <p class="muted small">✅ OAuth-клиент настроен. Если при входе видите
+        <code>redirect_uri_mismatch</code> — скопируйте адрес выше в
+        Cloud Console → Учётные данные → ваш клиент → «Авторизованные URI перенаправления» → Сохранить
+        (применяется сразу, ждать не нужно).</p>
     {% else %}
-      <p class="muted small">В <code>.env</code> не заданы <code>GOOGLE_CLIENT_ID</code> /
-        <code>GOOGLE_CLIENT_SECRET</code> — вход через Google недоступен.</p>
+      <p class="muted small">⚠️ Client ID/Secret не заданы — заполните форму ниже,
+        и вход через Google заработает без редактирования <code>.env</code>.</p>
     {% endif %}
+
+    <form method="post" style="margin-top:10px">
+      <input type="hidden" name="theme" value="{{ st.theme }}">
+      <label class="field"><span>Google OAuth Client ID</span>
+        <input type="text" name="oauth_client_id" value="{{ oauth_client_id_now }}"
+               placeholder="xxxxx.apps.googleusercontent.com" autocomplete="off"></label>
+      <label class="field"><span>Google OAuth Client Secret</span>
+        <input type="password" name="oauth_client_secret"
+               placeholder="{% if oauth_client_secret_set %}уже сохранён (введите новый, чтобы заменить){% else %}GOCSPX-...{% endif %}"
+               autocomplete="new-password"></label>
+      <label class="field"><span>Публичный адрес сайта (PUBLIC_BASE_URL)</span>
+        <input type="text" name="public_base_url" value="{{ public_base_url_now }}"
+               placeholder="https://search-pulintrit.cloudpub.ru — пусто = авто"></label>
+      <p class="muted small">Секрет сохраняется в <code>config.json</code> на сервере
+        (не попадает в git) и переопределяет <code>.env</code>. Адрес сайта нужен, если
+        открываете его через прокси/домен: redirect_uri строится именно от него.</p>
+      <button class="btn-primary" type="submit">Сохранить настройки входа</button>
+    </form>
+
+    <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+      <button type="button" class="btn-secondary" id="btnCheck">Проверить настройку у Google</button>
+      <a class="btn-secondary" href="/auth/setup">Пошаговая инструкция</a>
+      <a class="btn-secondary" href="/auth/login">Войти через Google</a>
+    </div>
+    <pre id="checkOut" class="mono small" style="white-space:pre-wrap;margin-top:10px;display:none;background:var(--bg-alt,#f6f8fa);padding:10px;border-radius:8px"></pre>
+    <div id="applyBox" style="display:none;margin-top:8px"></div>
+  </section>
+
+  <section class="card">
+    <h2>🔑 Ключи API для доступа к сайту извне</h2>
+    <p class="muted small">Здесь создаются два типа ключей:
+      <b>ключи поиска</b> (<code>Authorization: Bearer sk-...</code> для
+      <code>/api/v1/search</code> другими проектами) и
+      <b>ключ редактирования</b> (<code>sgpt-admin-...</code>) — по нему можно
+      читать и менять файлы сайта командами, как через GitHub, но быстрее.</p>
+    <form id="keyForm" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+      <label class="field" style="flex:1;min-width:160px"><span>Название ключа</span>
+        <input type="text" id="keyName" placeholder="например: qwen / мой ноутбук" required maxlength="60"></label>
+      <label class="field"><span>Срок действия</span>
+        <select id="keyDays">
+          <option value="7">7 дней</option>
+          <option value="30" selected>30 дней</option>
+          <option value="90">90 дней</option>
+          <option value="365">1 год</option>
+        </select></label>
+      <button class="btn-primary" type="submit">Создать ключ редактирования</button>
+    </form>
+    <div id="newKey" style="display:none;margin-top:10px;padding:10px;border:1px solid #1a73e8;border-radius:8px">
+      <b>Скопируйте ключ сейчас — он показывается один раз:</b><br>
+      <code id="newKeyValue" class="mono" style="word-break:break-all"></code>
+      <button type="button" class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('newKeyValue').innerText);this.textContent='✓'">Копировать</button>
+    </div>
+    <ul id="keyList" style="list-style:none;padding:0;margin:10px 0 0"></ul>
+    <p class="muted small">Для REST-API поиска (<code>/api/v1/*</code>) ключи задаются в
+      <code>.env → SEARCH_API_KEYS</code> (через админ-панель /admin или вручную).</p>
   </section>
 </main>
 {% endblock %}
@@ -214,6 +271,91 @@
     document.documentElement.setAttribute('data-theme', sel.value);
     localStorage.setItem('theme', sel.value);
   });
+
+  // --- Живая проверка OAuth-настройки у Google ---
+  const btnCheck = document.getElementById('btnCheck');
+  if (btnCheck) btnCheck.addEventListener('click', async () => {
+    const out = document.getElementById('checkOut');
+    const applyBox = document.getElementById('applyBox');
+    out.style.display = 'block'; out.textContent = 'Проверяю…';
+    applyBox.style.display = 'none'; applyBox.innerHTML = '';
+    const fd = new FormData();
+    const cid = document.querySelector('[name=oauth_client_id]').value.trim();
+    const csec = document.querySelector('[name=oauth_client_secret]').value.trim();
+    if (cid) fd.set('client_id', cid);
+    if (csec && !csec.startsWith('**')) fd.set('client_secret', csec);
+    try {
+      const r = await fetch('/auth/check', {method:'POST', body:fd});
+      const j = await r.json();
+      if (j.error) { out.textContent = '❌ ' + j.error; return; }
+      let t = 'Отправляем в Google:\n  ' + j.sent_uri +
+              '\n\nЧто зарегистрировано в консоли (' + (j.client_name||'клиент') + '):\n' +
+              (j.console_uris||[]).map(u=>'  '+u).join('\n');
+      if (j.ok) {
+        out.textContent = '✅ Всё совпадает! Вход через Google будет работать.\n\n' + t;
+      } else {
+        out.textContent = '❌ Адрес не совпадает — это и есть redirect_uri_mismatch.\n\n' + t;
+        const same = j.same_host || [];
+        if (same.length) {
+          applyBox.style.display = 'block';
+          applyBox.innerHTML = '<div style="padding:10px;border:1px solid #fbbc05;border-radius:8px">' +
+            '💡 В консоли уже есть адрес на этом домене: <code>'+same[0]+'</code>.<br>' +
+            'Сделать его рабочим адресом сайта? <button class="btn-primary" id="applyUri">Применить</button></div>';
+          document.getElementById('applyUri').onclick = async () => {
+            const f2 = new FormData(); f2.set('uri', same[0]);
+            const r2 = await fetch('/auth/use_uri', {method:'POST', body:f2});
+            location.href = '/auth/login';
+          };
+        } else {
+          applyBox.style.display = 'block';
+          applyBox.innerHTML = '<p class="muted small">Добавьте первый адрес выше в консоль Google ' +
+            '(Учётные данные → ваш клиент → «Авторизованные URI перенаправления»), сохраните — ' +
+            'и нажмите «Проверить» снова.</p>';
+        }
+      }
+    } catch(e) { out.textContent = 'Ошибка проверки: ' + e; }
+  });
+
+  // --- Ключи редактирования прямо из настроек ---
+  async function loadKeys() {
+    const ul = document.getElementById('keyList');
+    if (!ul) return;
+    try {
+      const r = await fetch('/settings/keys');
+      const j = await r.json();
+      ul.innerHTML = (j.keys||[]).map(k =>
+        '<li style="display:flex;gap:8px;align-items:center;padding:4px 0">' +
+        '<span class="mono">🔑 '+k.name+'</span>' +
+        '<span class="muted small">до '+k.expires+'</span>' +
+        '<button class="btn-copy" data-id="'+k.id+'">Отзвать</button></li>').join('')
+        || '<li class="muted small">Ключей пока нет.</li>';
+      ul.querySelectorAll('[data-id]').forEach(b => b.onclick = async () => {
+        await fetch('/settings/keys/revoke', {method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({id:b.dataset.id})});
+        loadKeys();
+      });
+    } catch(e) {}
+  }
+  const keyForm = document.getElementById('keyForm');
+  if (keyForm) keyForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const name = document.getElementById('keyName').value.trim() || 'key';
+    const days = parseInt(document.getElementById('keyDays').value, 10);
+    const r = await fetch('/settings/keys/create', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name, days})});
+    const j = await r.json();
+    if (j.key) {
+      document.getElementById('newKeyValue').textContent = j.key;
+      document.getElementById('newKey').style.display = 'block';
+      loadKeys();
+    } else if (j.error) {
+      alert(j.error + (j.hint ? ': ' + j.hint : ''));
+    }
+  });
+  loadKeys();
+
   {% if saved %}
     setTimeout(() => { const t = document.getElementById('savedToast'); if (t) t.remove(); }, 3000);
   {% endif %}

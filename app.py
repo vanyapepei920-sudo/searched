@@ -69,11 +69,76 @@ SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_hex(32)
 # Если оставить пустым — адрес вычисляется автоматически из запроса.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
+# Конфигурация, которую можно менять ПРЯМО НА САЙТЕ (страница настроек / админка),
+# без ручного редактирования .env. Хранится в config.json рядом с app.py, чтобы
+# пережить перезапуск сервера. Приоритет: это значение > значения из .env.
+RUNTIME_CFG: dict = {}
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CFG_KEYS = ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "PUBLIC_BASE_URL",
+            "GOOGLE_API_KEY", "GOOGLE_CX_ID")
+
+
+def load_runtime_cfg() -> None:
+    global RUNTIME_CFG
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            RUNTIME_CFG = {k: str(v).strip() for k, v in data.items()
+                           if k in CFG_KEYS and v}
+    except Exception:
+        RUNTIME_CFG = {}
+
+
+def save_runtime_cfg(updates: dict) -> None:
+    """Обновляет config.json (None/'' — удалить ключ, вернуть к значению .env)."""
+    load_runtime_cfg()
+    for k, v in updates.items():
+        if k not in CFG_KEYS:
+            continue
+        if v is None or not str(v).strip():
+            RUNTIME_CFG.pop(k, None)
+        else:
+            RUNTIME_CFG[k] = str(v).strip().rstrip("/") if k == "PUBLIC_BASE_URL" \
+                else str(v).strip()
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(RUNTIME_CFG, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        app.logger.error("Не удалось сохранить config.json: %s", e)
+
+
+def cfg(key: str, default_env: str = "") -> str:
+    """Текущее значение конфигурации: runtime-настройка сайта, иначе .env."""
+    return RUNTIME_CFG.get(key) or default_env
+
+
+def oauth_client_id() -> str:
+    return cfg("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
+
+
+def oauth_client_secret() -> str:
+    return cfg("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET)
+
+
+def cse_key() -> str:
+    return cfg("GOOGLE_API_KEY", GOOGLE_API_KEY)
+
+
+def cse_cx() -> str:
+    return cfg("GOOGLE_CX_ID", GOOGLE_CX_ID)
+
+
+def base_url_override() -> str:
+    """Текущий PUBLIC_BASE_URL: сначала runtime-значение (изменено через сайт),
+    затем .env. Пустая строка означает «вычислять автоматически»."""
+    return RUNTIME_CFG.get("PUBLIC_BASE_URL", PUBLIC_BASE_URL).strip().rstrip("/")
+
 
 def public_origin() -> str:
     """Публичный адрес сайта (scheme://host[:port]) — источник redirect_uri."""
-    if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL
+    if base_url_override():
+        return base_url_override()
     # Прокси (cloudpub/ngrok/cloudflared): смотрим служебные заголовки.
     for h in ("X-Forwarded-Prefix", ):
         pass  # префиксы не поддерживаем — приложение живёт в корне домена
@@ -547,7 +612,7 @@ def client_id_diagnostic() -> dict:
     ровно тот список, с которым Google сверяет redirect_uri. Если запрос не
     удался (нет ключа/интернета), тихо возвращаем пустой словарь.
     """
-    if not GOOGLE_CLIENT_ID:
+    if not oauth_client_id():
         return {}
     now = time.time()
     if _CLIENT_DIAG_CACHE["data"] is not None and now - _CLIENT_DIAG_CACHE["ts"] < 60:
@@ -556,7 +621,7 @@ def client_id_diagnostic() -> dict:
     try:
         r = _http.get(
             GOOGLE_CLIENT_METADATA_URL
-            + quote(GOOGLE_CLIENT_ID, safe=""),
+            + quote(oauth_client_id(), safe=""),
             timeout=8,
         )
         if r.status_code == 200:
@@ -602,7 +667,7 @@ def pick_redirect_uri() -> str:
 
 def build_google_auth_url(state: str, next_url: str = "/") -> str:
     params = {
-        "client_id": GOOGLE_CLIENT_ID,
+        "client_id": oauth_client_id(),
         "redirect_uri": pick_redirect_uri(),
         "response_type": "code",
         # openid обязателен для обмена кода на токены с профилем Google
@@ -652,7 +717,7 @@ def _state_data(state: str) -> dict:
 
 def google_button() -> str:
     """HTML кнопки «Войти через Google» для страниц /login и /register."""
-    if not GOOGLE_CLIENT_ID:
+    if not oauth_client_id():
         return ""
     return """
     <div class="or-sep"><span>или</span></div>
@@ -675,8 +740,8 @@ def google_exchange_code(code: str, redirect_uri: str):
         r = _http.s.post(
             GOOGLE_TOKEN_URL,
             data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
+                "client_id": oauth_client_id(),
+                "client_secret": oauth_client_secret(),
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": redirect_uri or oauth_redirect_uri(),
@@ -892,8 +957,8 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool 
     except Exception:
         st = dict(SETTINGS_DEFAULTS)
     engine = st.get("search_engine", "auto")
-    api_key = st.get("cse_key") or GOOGLE_API_KEY
-    cx_id = st.get("cse_id") or GOOGLE_CX_ID
+    api_key = st.get("cse_key") or cse_key()
+    cx_id = st.get("cse_id") or cse_cx()
 
     cse_error = None
     if engine == "duckduckgo":
@@ -1232,7 +1297,7 @@ def register_page():
 @app.route("/auth/login")
 def login():
     """Вход через Google-аккаунт (OAuth 2.0)."""
-    if not GOOGLE_CLIENT_ID:
+    if not oauth_client_id():
         return render_template(
             "error.html",
             title="Не настроен вход через Google",
@@ -1321,6 +1386,105 @@ def redirect_uri_info():
     )
 
 
+@app.route("/auth/setup")
+def auth_setup():
+    """Инструкция по устранению redirect_uri_mismatch: показывает нужный адрес,
+    список URI из консоли Google и форму проверки."""
+    uri = oauth_redirect_uri()
+    diag = client_id_diagnostic()
+    allowed = diag.get("redirect_uris") or []
+    ok = bool(allowed) and uri.rstrip("/") in allowed
+    return render_template(
+        "error.html",
+        title="Настройка входа через Google",
+        detail=(
+            "<b>Шаг 1.</b> Скопируйте адрес:<br>"
+            f"<code style='font-size:15px'>{escape(uri)}</code><br><br>"
+            "<b>Шаг 2.</b> Вставьте его в Google Cloud Console → «Учётные данные» → "
+            "ваш OAuth-клиент → «Авторизованные URI перенаправления» → Сохранить. "
+            "Изменения применяются сразу, ждать не нужно.<br><br>"
+            "<b>Шаг 3.</b> Вернитесь сюда и нажмите «Проверить» ниже — если адрес "
+            "совпадает, вход заработает."
+            + ("<br><br>✅ Текущий адрес ЕСТЬ в списке консоли Google. "
+               "<a href='/auth/login'>Войти</a>" if ok else
+               ("<br><br>⚠️ Адреса в вашей консоли: "
+                + (", ".join(f"<code>{escape(u)}</code>" for u in allowed) or "не удалось получить — проверьте Client ID/Secret в Настройках")
+                + "<br><br>Если среди них есть адрес на этом же домене — откройте "
+                  "<a href='/settings'>Настройки → 🔐 Аккаунт и вход</a> и нажмите "
+                  "«Применить» напротив нужного варианта."))
+            + "<br><br><a href='/settings'>Перейти в Настройки</a> | "
+              "<a href='/auth/login'>Вход через Google</a>"
+        ),
+    )
+
+
+@app.route("/auth/use_uri", methods=["POST"])
+def auth_use_uri():
+    """Применяет redirect_uri, который реально зарегистрирован в консоли Google:
+    сохраняет его публичную часть как PUBLIC_BASE_URL (config.json) и сразу
+    продолжает вход."""
+    uri = (request.form.get("uri") or "").strip()
+    p = urlparse(uri)
+    if not uri.endswith("/auth/callback") or p.scheme not in ("http", "https") \
+            or not p.netloc:
+        return render_template(
+            "error.html", title="Некорректный адрес",
+            detail="Ожидался адрес вида https://хост/auth/callback")
+    diag = client_id_diagnostic()
+    allowed = diag.get("redirect_uris") or []
+    if allowed and uri.rstrip("/") not in allowed:
+        return render_template(
+            "error.html", title="Этого адреса нет в консоли Google",
+            detail=f"Доступно: {', '.join('<code>'+escape(u)+'</code>' for u in allowed)}")
+    save_runtime_cfg({"PUBLIC_BASE_URL": f"{p.scheme}://{p.netloc}"})
+    return redirect(url_for("login_page", next=safe_next(request.args.get("next", "/"))))
+
+
+def oauth_client_id_check(cid: str) -> str:
+    """Возвращает "" — чтобы снять runtime-переопределение и вернуться к .env."""
+    return ""
+
+
+@app.route("/auth/check", methods=["POST"])
+def auth_check():
+    """Живая проверка OAuth-настройки: что отправит приложение vs что ждёт Google.
+    Параметры формы: client_id, client_secret (опц.), apply=1 — сохранить как
+    текущую настройку сайта."""
+    cid = request.form.get("client_id", "").strip() or oauth_client_id()
+    csec = request.form.get("client_secret", "").strip() or oauth_client_secret()
+    if not cid:
+        return jsonify({"ok": False, "error": "Не указан Client ID"}), 400
+    # временно подставляем проверяемые значения для диагностического запроса
+    save_runtime_cfg({"GOOGLE_CLIENT_ID": cid, "GOOGLE_CLIENT_SECRET": csec})
+    _CLIENT_DIAG_CACHE.update({"ts": 0.0, "data": None})
+    try:
+        diag = client_id_diagnostic()
+    finally:
+        if request.form.get("apply") != "1":
+            save_runtime_cfg({"GOOGLE_CLIENT_ID": oauth_client_id_check(cid)})
+        _CLIENT_DIAG_CACHE.update({"ts": 0.0, "data": None})
+    if not diag.get("available"):
+        return jsonify({"ok": False,
+                        "error": "Google не вернул конфигурацию клиента — "
+                                 "проверьте Client ID и доступ в интернет"}), 200
+    uri = oauth_redirect_uri()
+    allowed = diag.get("redirect_uris") or []
+    match = uri.rstrip("/") in allowed
+    result = {
+        "ok": match,
+        "sent_uri": uri,
+        "console_uris": allowed,
+        "client_name": diag.get("client_name", ""),
+    }
+    if not match:
+        host = urlparse(uri).netloc
+        result["same_host"] = [u for u in allowed if urlparse(u).netloc == host]
+    if request.form.get("apply") == "1" and csec:
+        save_runtime_cfg({"GOOGLE_CLIENT_ID": cid, "GOOGLE_CLIENT_SECRET": csec})
+        result["saved"] = True
+    return jsonify(result)
+
+
 @app.route("/auth/callback")
 def callback():
     # Состояние (state) храним сервером, а не только в cookie: сторонние
@@ -1336,19 +1500,52 @@ def callback():
     error = request.args.get("error", "")
     if error == "redirect_uri_mismatch":
         uri = oauth_redirect_uri()
+        diag = client_id_diagnostic()
+        allowed = diag.get("redirect_uris") or []
+        # Если в консоли есть адрес на этом же хосте (например http вместо https
+        # или без порта) — предложим использовать ЕГО: это лечит mismatch прямо
+        # сейчас, без ручного редактирования .env.
+        host = urlparse(uri).netloc
+        same_host = [u for u in allowed if urlparse(u).netloc == host]
+        quick = ""
+        if same_host and same_host[0].rstrip("/") != uri.rstrip("/"):
+            quick = (
+                "<form method='post' action='/auth/use_uri' style='margin:12px 0'>"
+                "<input type='hidden' name='uri' value='" + escape(same_host[0]) + "'>"
+                "<button class='btn-primary' type='submit'"
+                " style='padding:8px 16px;border-radius:6px;border:0;cursor:pointer;"
+                "background:#1a73e8;color:#fff'>"
+                "Использовать этот адрес и войти</button></form>"
+                "<p class='muted small'>Приложение переключится на "
+                "<code>" + escape(same_host[0]) + "</code> — он уже есть в вашей "
+                "консоли Google.</p>"
+            )
+        console_list = ""
+        if allowed:
+            console_list = ("<br><br>Адреса, которые Google видит в вашей консоли: "
+                            + ", ".join(f"<code>{escape(u)}</code>" for u in allowed))
+        else:
+            console_list = ("<br><br>Список URI из консоли получить не удалось — "
+                            "проверьте GOOGLE_CLIENT_ID в настройках сайта.")
         return render_template(
             "error.html",
             title="Ошибка входа: redirect_uri_mismatch",
             detail=(
-                "Google отклонил адрес перенаправления приложения.<br><br>"
-                "Добавьте в Google Cloud Console → «URI перенаправления» вашего "
-                "OAuth-клиента РОВНО этот адрес (сохраните и подождите ~1 минуту):"
-                f"<br><br><code style='font-size:15px'>{uri}</code><br><br>"
-                "Если вы добавили его через <a href='/auth/redirect-uri'>"
-                "/auth/redirect-uri</a> и ошибка осталась — проверьте, что вход "
-                "вы делаете по тому же адресу (https/домен), которому соответствует "
-                "этот redirect_uri, или задайте PUBLIC_BASE_URL в .env.<br><br>"
-                "<a href='/auth/login'>Попробовать ещё раз</a> | "
+                "Google сверяет адрес перенаправления <b>посимвольно</b> со списком "
+                "в Cloud Console (схема http/https, домен, порт — всё должно совпасть)."
+                "<br><br>Сейчас приложение отправляет:<br>"
+                f"<code style='font-size:15px'>{escape(uri)}</code><br><br>"
+                "<b>Вариант 1 (быстрый):</b> откройте "
+                "<a href='/settings'>Настройки → 🔐 Аккаунт и вход через Google</a>, "
+                "убедитесь, что там заполнены Client ID/Secret, и нажмите "
+                "«Проверить настройку» — страница точно скажет, какой адрес ждёт "
+                "Google, и позволит применить его одним кликом."
+                "<br><br><b>Вариант 2:</b> добавьте адрес выше в Cloud Console → "
+                "Учётные данные → ваш OAuth-клиент → «Авторизованные URI "
+                "перенаправления» → Сохранить (применяется сразу, ждать не нужно)."
+                + quick + console_list +
+                "<br><br><a href='/auth/login'>Попробовать ещё раз</a> | "
+                "<a href='/settings'>Настройки</a> | "
                 "<a href='/login'>обычный вход</a>"
             ),
         )
@@ -1518,6 +1715,23 @@ def settings_page():
         new["search_engine"] = request.form.get("search_engine", st["search_engine"])
         new["cse_key"] = request.form.get("cse_key", st["cse_key"]).strip()
         new["cse_id"] = request.form.get("cse_id", st["cse_id"]).strip()
+        # Секреты OAuth и адрес сайта сохраняются в config.json (переопределяют .env),
+        # чтобы настройка входа работала прямо со страницы без ручного редактирования .env.
+        oauth_updates = {}
+        cid = request.form.get("oauth_client_id", "").strip()
+        csec = request.form.get("oauth_client_secret", "").strip()
+        burl = request.form.get("public_base_url", "").strip().rstrip("/")
+        if "oauth_client_id" in request.form:
+            oauth_updates["GOOGLE_CLIENT_ID"] = cid or None
+        if "oauth_client_secret" in request.form and csec and not csec.startswith("**"):
+            oauth_updates["GOOGLE_CLIENT_SECRET"] = csec
+        if "public_base_url" in request.form:
+            if burl and not (burl.startswith("http://") or burl.startswith("https://")):
+                burl = "https://" + burl
+            oauth_updates["PUBLIC_BASE_URL"] = burl or None
+        if any(k in request.form for k in
+               ("oauth_client_id", "oauth_client_secret", "public_base_url")):
+            save_runtime_cfg(oauth_updates)
         for b in ("safe_search", "ai_enabled", "new_tab", "instant_answers", "sound", "autosuggest"):
             new[b] = request.form.get(b) == "on"
         resp = redirect(url_for("settings_page", saved=1))
@@ -1527,7 +1741,7 @@ def settings_page():
         saved = True
 
     # Статус Custom Search JSON API для текущего ключа (для раздела диагностики)
-    eff_key = st.get("cse_key") or GOOGLE_API_KEY
+    eff_key = st.get("cse_key") or cse_key()
     api_status, api_text = ("", "")
     if eff_key:
         try:
@@ -1544,9 +1758,12 @@ def settings_page():
         valid_langs=VALID_LANGS,
         valid_rpp=VALID_RPP,
         redirect_uri=oauth_redirect_uri(),
-        oauth_configured=bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        oauth_configured=bool(oauth_client_id() and oauth_client_secret()),
+        oauth_client_id_now=oauth_client_id(),
+        oauth_client_secret_set=bool(oauth_client_secret()),
+        public_base_url_now=base_url_override(),
         cse_has_key=bool(eff_key),
-        cse_has_cx=bool(st.get("cse_id") or GOOGLE_CX_ID),
+        cse_has_cx=bool(st.get("cse_id") or cse_cx()),
         cse_api_status=api_status,
         cse_api_text=api_text,
         cse_sys_ok=st.get("cse_sys_ok"),
@@ -1554,13 +1771,56 @@ def settings_page():
     )
 
 
+@app.route("/settings/keys/create", methods=["POST"])
+def settings_keys_create():
+    """Создание ключа редактирования прямо из Настроек. Требует админ-куку
+    (вход в /admin по паролю) — так панель появляется, даже если сервер
+    обновился не полностью."""
+    if not admin_session_ok():
+        return jsonify({"error": "unauthorized",
+                        "hint": "Откройте /admin и войдите по паролю — "
+                                "затем вернитесь в Настройки"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        days = int(data.get("days", 30) or 30)
+    except (TypeError, ValueError):
+        days = 30
+    token, kid = make_admin_key(str(data.get("name", "key"))[:60], days)
+    return jsonify({"ok": True, "id": kid, "key": token})
+
+
+@app.route("/settings/keys")
+def settings_keys_list():
+    if not admin_session_ok():
+        return jsonify({"keys": []}), 403
+    rows = db().execute(
+        "SELECT id,name,created_at,expires_at,revoked FROM admin_keys "
+        "ORDER BY id DESC LIMIT 100").fetchall()
+    return jsonify({"keys": [{
+        "id": r["id"], "name": r["name"],
+        "expires": time.strftime("%Y-%m-%d", time.localtime(r["expires_at"]))
+        if r["expires_at"] else "∞",
+    } for r in rows if not r["revoked"]]})
+
+
+@app.route("/settings/keys/revoke", methods=["POST"])
+def settings_keys_revoke():
+    if not admin_session_ok():
+        return jsonify({"error": "unauthorized"}), 403
+    data = request.get_json(silent=True) or {}
+    with db() as conn:
+        conn.execute("UPDATE admin_keys SET revoked=1 WHERE id=?",
+                     (int(data.get("id", 0)),))
+    return jsonify({"ok": True})
+
+
 @app.route("/settings/diag")
 def settings_diag():
     """AJAX-проверки из страницы настроек: check=api | check=cx."""
     st = get_settings()
     check = request.args.get("check", "api")
-    key = st.get("cse_key") or GOOGLE_API_KEY
-    cx = st.get("cse_id") or GOOGLE_CX_ID
+    key = st.get("cse_key") or cse_key()
+    cx = st.get("cse_id") or cse_cx()
     if check == "cx":
         ok, msg = check_cx_alive(key, cx)
         new_st = dict(st)
@@ -1692,8 +1952,8 @@ def health():
     return jsonify(
         {
             "status": "ok",
-            "cse_configured": bool(GOOGLE_API_KEY and GOOGLE_CX_ID),
-            "oauth_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+            "cse_configured": bool(cse_key() and cse_cx()),
+            "oauth_configured": bool(oauth_client_id() and oauth_client_secret()),
             "redirect_uri": uri,
             "ai_provider": "pollinations.ai",
             "ai_configured": AI_ENABLED_DEFAULT,
@@ -1717,7 +1977,12 @@ ADMIN_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 BACKUP_DIR = os.path.join(PROJECT_ROOT, "backups")
 ADMIN_HIDDEN_DIRS = {".git", "__pycache__", "backups", "node_modules", ".venv"}
-ADMIN_PROTECTED_FILES = {"users.db", ".env"}  # чтение/запись запрещены
+ADMIN_PROTECTED_FILES = {"users.db"}  # чтение/запись запрещены
+
+
+def is_protected_name(name: str) -> bool:
+    """Защищённые файлы: БД и все секреты (.env*, config.json)."""
+    return name == "users.db" or name.startswith(".env") or name == "config.json"
 
 
 def _sign(value: str) -> str:
@@ -1795,8 +2060,10 @@ def safe_project_path(rel: str):
     parts = rel.split("/")
     if any(p in ADMIN_HIDDEN_DIRS for p in parts[:-1]) or parts[0] in ADMIN_HIDDEN_DIRS:
         raise ValueError("Системная папка недоступна")
-    if os.path.basename(full) in ADMIN_PROTECTED_FILES or rel in ADMIN_PROTECTED_FILES:
-        raise ValueError("Этот файл защищён от просмотра/изменения")
+    base = os.path.basename(full)
+    if base in ADMIN_PROTECTED_FILES or rel in ADMIN_PROTECTED_FILES \
+            or is_protected_name(base):
+        raise ValueError("Этот файл защищён от просмотра/изменения (секреты — только через Настройки)")
     return full
 
 
@@ -1809,7 +2076,8 @@ def admin_file_tree():
         if rel_root == ".":
             rel_root = ""
         for f in sorted(files):
-            if f in ADMIN_PROTECTED_FILES or f.endswith((".pyc", ".db", ".log")):
+            if (f in ADMIN_PROTECTED_FILES or is_protected_name(f)
+                    or f.endswith((".pyc", ".db", ".log"))):
                 continue
             p = os.path.join(rel_root, f) if rel_root else f
             try:
@@ -2125,8 +2393,8 @@ def admin_api_diag():
     err = require_admin()
     if err:
         return err
-    key = GOOGLE_API_KEY
-    cx = GOOGLE_CX_ID
+    key = cse_key()
+    cx = cse_cx()
     st_status, st_text = cse_api_diag(key) if key else ("no_key", "GOOGLE_API_KEY не задан")
     cx_ok, cx_msg = check_cx_alive(key, cx) if (key and cx) else (False, "cx не задан")
     ai_ok = "?"
@@ -2142,7 +2410,7 @@ def admin_api_diag():
         "google_network": "доступен" if net_ok() else "НЕДОСТУПЕН (TLS/сеть)",
         "cse_api": f"{st_status}: {st_text}",
         "search_system_cx": ("жива: " + cx_msg) if cx_ok else ("проблема: " + cx_msg),
-        "oauth_configured": "да" if (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET) else "нет",
+        "oauth_configured": "да" if (oauth_client_id() and oauth_client_secret()) else "нет",
         "redirect_uri": oauth_redirect_uri(),
         "ai_pollinations": ai_ok,
         "api_keys_count": len(SEARCH_API_KEYS),
@@ -2170,6 +2438,9 @@ def admin_api_restart():
         os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=_do, daemon=True).start()
     return jsonify({"ok": True, "message": "перезапуск процесса через 2 секунды"})
+
+
+load_runtime_cfg()
 
 
 if __name__ == "__main__":

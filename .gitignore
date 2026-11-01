@@ -1,4 +1,3 @@
-__pycache__/
-*.pyc
-__pycache__/
-backups/
+.env
+.env.local
+*.env.*
