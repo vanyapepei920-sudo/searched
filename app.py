@@ -20,7 +20,11 @@ import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
+import ssl
+import sys
+import threading
 import time
 from urllib.parse import urlencode, urlparse, quote
 
@@ -113,9 +117,95 @@ SEARCH_API_KEYS = {
 }
 
 CSE_URL = "https://www.googleapis.com/customsearch/v1"
+# Запасные хосты Google API: если основной www.googleapis.com недоступен
+# (SSL-ошибки, блокировки прокси/оператора — частая история на Termux),
+# пробуем эти адреса.
+CSE_FALLBACK_HOSTS = [
+    "https://customsearch.googleapis.com/customsearch/v1",
+    "https://www.googleapis.com.cn/customsearch/v1",
+]
 CSE_ENABLE_LINK = ("https://console.cloud.google.com/apis/library/customsearch.googleapis.com"
                    "?project=_")
 NUM_RESULTS = 10
+
+
+def _make_ssl_adapter():
+    """HTTPSAdapter с увеличенным числом повторов и собственным SSL-контекстом.
+
+    Ошибка SSLEOFError («EOF occurred in violation of protocol») обычно
+    возникает из-за обрыва TLS-соединения посредником (провайдер/прокси/CGNAT).
+    Помогает: повторные попытки, короткое живое соединение (Connection: close)
+    и запасные хосты.
+    """
+    try:
+        from requests.adapters import HTTPAdapter
+        ctx = ssl.create_default_context()
+        adapter = HTTPAdapter(max_retries=3, pool_connections=4, pool_maxsize=8)
+        return adapter
+    except Exception:
+        return None
+
+
+class SearchSession:
+    """Обёртка над requests с повторами, таймаутами и перебором хостов."""
+
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({
+            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+            "Accept": "*/*",
+            "Accept-Language": "ru,en;q=0.9",
+        })
+        ad = _make_ssl_adapter()
+        if ad is not None:
+            self.s.mount("https://", ad)
+
+    def get(self, url, params=None, timeout=15, hosts=None, headers=None):
+        """GET с перебором основного + запасных хостов и короткими ретраями."""
+        urls = [url] + list(hosts or [])
+        last_exc = None
+        for u in urls:
+            try:
+                r = self.s.get(u, params=params, timeout=timeout, headers=headers)
+                # 5xx от шлюзов (часто сопровождается обрывом TLS) — пробуем следующий хост
+                if r.status_code in (500, 502, 503, 504):
+                    last_exc = requests.RequestException(
+                        f"HTTP {r.status_code} от {u.split('/')[2]}")
+                    continue
+                return r
+            except requests.RequestException as e:
+                last_exc = e
+        raise last_exc if last_exc else requests.RequestException("нет URL для запроса")
+
+
+_http = SearchSession()
+
+# Кеш сетевой доступности: не долбим Google каждые полсекунды, если сеть легла.
+_net_cache = {"ok": None, "checked_at": 0.0, "lock": threading.Lock()}
+NET_CACHE_TTL = 30  # секунд
+
+
+def network_check(host="www.googleapis.com", port=443, timeout=4):
+    """Быстрая проверка: есть ли вообще выход в интернет к host:port."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def net_ok(refresh=False):
+    """Помеченное временем состояние сети (кеш), чтобы не тормозить ответы."""
+    now = time.time()
+    with _net_cache["lock"]:
+        if (not refresh and _net_cache["ok"] is not None
+                and now - _net_cache["checked_at"] < NET_CACHE_TTL):
+            return _net_cache["ok"]
+        ok = network_check()
+        _net_cache["ok"] = ok
+        _net_cache["checked_at"] = now
+        return ok
 
 # ----------------------------------------------------------------------------
 # Настройки пользователя (страница /settings): сохраняются в cookie браузера,
@@ -181,7 +271,7 @@ def cse_api_diag(api_key: str):
         return hit[1]
     result = None
     try:
-        r = requests.get(
+        r = _http.get(
             "https://cloudbilling.googleapis.com/v1/services",
             params={"key": api_key, "pageSize": 300},
             timeout=15,
@@ -220,8 +310,9 @@ def check_cx_alive(api_key: str, cx_id: str):
     if not api_key or not cx_id:
         return (False, "Нужны и ключ, и CX")
     try:
-        r = requests.get(CSE_URL, params={"key": api_key, "cx": cx_id,
-                                          "q": "test", "num": 1}, timeout=15)
+        r = _http.get(CSE_URL, params={"key": api_key, "cx": cx_id,
+                                       "q": "test", "num": 1}, timeout=15,
+                      hosts=CSE_FALLBACK_HOSTS)
         if r.status_code == 200:
             n = len(r.json().get("items", []) or [])
             return (True, f"CX работает, тестовая выдача: {n} результат(ов)")
@@ -447,7 +538,7 @@ def client_id_diagnostic() -> dict:
         return _CLIENT_DIAG_CACHE["data"]
     data: dict = {}
     try:
-        r = requests.get(
+        r = _http.get(
             GOOGLE_CLIENT_METADATA_URL
             + quote(GOOGLE_CLIENT_ID, safe=""),
             timeout=8,
@@ -565,7 +656,7 @@ def google_exchange_code(code: str, redirect_uri: str):
     session["oauth_used_uri"], а не вычисляется заново на ходу.
     """
     try:
-        r = requests.post(
+        r = _http.s.post(
             GOOGLE_TOKEN_URL,
             data={
                 "client_id": GOOGLE_CLIENT_ID,
@@ -586,7 +677,7 @@ def google_exchange_code(code: str, redirect_uri: str):
 
 def google_userinfo(access_token: str):
     try:
-        r = requests.get(
+        r = _http.get(
             GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=15,
@@ -792,43 +883,66 @@ def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool 
     if engine == "duckduckgo":
         return duckduckgo_search(query, page=page, num=num, safe=safe)
     if api_key and cx_id:
-        try:
-            r = requests.get(
-                CSE_URL,
-                params={
-                    "key": api_key,
-                    "cx": cx_id,
-                    "q": query,
-                    "num": min(num, 10),
-                    "start": max(page, 1) * num - num + 1,
-                    **({"safe": "active"} if safe else {}),
-                },
-                timeout=15,
-            )
-            if r.status_code == 200:
-                out = _parse_cse(r.json(), page, num)
-                out["provider"] = "google"
-                return out
+        # Если сеть к Google недоступна (кеш проверки), не тратим время на
+        # таймауты — сразу идём в резервный поиск с понятным предупреждением.
+        if not net_ok():
+            cse_error = ("Нет соединения с googleapis.com (проверьте Wi-Fi/мобильную сеть; "
+                         "на Termux частая причина — прокси оператора или блокировка TLS)")
+        else:
             try:
-                msg = r.json().get("error", {}).get("message", r.text)
-            except Exception:
-                msg = r.text
-            cse_error = f"Google API: {msg}"
-            help_text = _cse_error_help(msg)
-            # Авто-диагностика при ошибках доступа к API: результат кладём в
-            # g.cse_diag — страница результатов покажет точный статус и ссылку.
-            low = msg.lower()
-            if ("does not have the access" in low or "not been used" in low
-                    or "access not config" in low):
+                r = _http.get(
+                    CSE_URL,
+                    params={
+                        "key": api_key,
+                        "cx": cx_id,
+                        "q": query,
+                        "num": min(num, 10),
+                        "start": max(page, 1) * num - num + 1,
+                        **({"safe": "active"} if safe else {}),
+                    },
+                    timeout=15,
+                    hosts=CSE_FALLBACK_HOSTS,
+                )
+                if r.status_code == 200:
+                    out = _parse_cse(r.json(), page, num)
+                    out["provider"] = "google"
+                    return out
                 try:
-                    st_status, st_text = cse_api_diag(api_key)
-                    g.cse_diag = {"status": st_status, "text": st_text}
+                    msg = r.json().get("error", {}).get("message", r.text)
                 except Exception:
-                    pass
-            if help_text:
-                cse_error += "\n💡 " + help_text
-        except requests.RequestException as e:
-            cse_error = f"Сеть недоступна для Google API: {e}"
+                    msg = r.text
+                cse_error = f"Google API: {msg}"
+                help_text = _cse_error_help(msg)
+                # Авто-диагностика при ошибках доступа к API: результат кладём в
+                # g.cse_diag — страница результатов покажет точный статус и ссылку.
+                low = msg.lower()
+                if ("does not have the access" in low or "not been used" in low
+                        or "access not config" in low):
+                    try:
+                        st_status, st_text = cse_api_diag(api_key)
+                        g.cse_diag = {"status": st_status, "text": st_text}
+                    except Exception:
+                        pass
+                if help_text:
+                    cse_error += "\n💡 " + help_text
+            except requests.RequestException as e:
+                # Обновляем кеш сети: возможно, она только что легла/поднялась
+                ok_now = net_ok(refresh=True)
+                detail = str(e.__cause__ or e)[:300]
+                if isinstance(e.__cause__, ssl.SSLError) or "SSL" in type(e).__name__ \
+                        or "UNEXPECTED_EOF" in detail or "SSLEOF" in detail:
+                    cse_error = (
+                        "Соединение с Google API обрывается на уровне TLS "
+                        "(SSLEOFError). Это почти всегда сеть/провайдер/прокси, а не "
+                        "настройки ключа: попробуйте переключить Wi-Fi ↔ мобильный "
+                        "интернет, выключить VPN/прокси или повторить позже. "
+                        f"Детали: {detail}"
+                    )
+                elif not ok_now:
+                    cse_error = ("Нет соединения с googleapis.com — проверьте интернет. "
+                                 f"Детали: {detail}")
+                else:
+                    cse_error = f"Сеть недоступна для Google API: {detail}"
     else:
         cse_error = "GOOGLE_API_KEY / GOOGLE_CX_ID не настроены в .env"
 
@@ -868,7 +982,7 @@ def ai_answer(query: str, results: list, model=None):
         },
     ]
     try:
-        r = requests.post(
+        r = _http.s.post(
             f"{POLLINATIONS_URL}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
             json={
@@ -1567,6 +1681,7 @@ def health():
             "ai_provider": "pollinations.ai",
             "ai_configured": AI_ENABLED_DEFAULT,
             "api_keys_loaded": len(SEARCH_API_KEYS),
+            "network_google_reachable": net_ok(),
         }
     )
 
