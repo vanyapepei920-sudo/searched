@@ -300,6 +300,13 @@ app.secret_key = SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["PREFERRED_URL_SCHEME"] = "http"
 
+# Определяем HTTPS за прокси (cloudpub/ngrok/cloudflared) по X-Forwarded-Proto:
+# без этого Flask не ставит на cookie сессии флаг Secure и SameSite=None,
+# а браузеры (Safari и др.) такие cookie в HTTPS-контексте отбрасывают —
+# вход «сбрасывался» сразу после логина.
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 
 @app.context_processor
 def inject_globals():
@@ -622,6 +629,21 @@ def _cse_error_help(msg: str) -> str:
     return ""
 
 
+def normalize_link(link: str) -> str:
+    """CSE иногда отдаёт ссылку без схемы («example.com/page») — такая ссылка
+    в браузере открывалась как несуществующая страница нашего же сайта.
+    Исправляем: относительные адреса превращаем в https://."""
+    link = (link or "").strip()
+    if not link:
+        return link
+    low = link.lower()
+    if low.startswith(("http://", "https://", "mailto:", "tel:", "data:", "#")):
+        return link
+    if link.startswith("//"):
+        return "https:" + link
+    return "https://" + link
+
+
 def _parse_cse(data: dict, page: int, num: int):
     items = []
     for it in data.get("items", []):
@@ -632,7 +654,7 @@ def _parse_cse(data: dict, page: int, num: int):
         items.append(
             {
                 "title": it.get("title", ""),
-                "link": it.get("link", ""),
+                "link": normalize_link(it.get("link", "")),
                 "snippet": it.get("snippet", ""),
                 "displayLink": it.get("displayLink", ""),
                 "thumbnail": thumb,
@@ -649,47 +671,106 @@ def _parse_cse(data: dict, page: int, num: int):
 
 
 def duckduckgo_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool = True):
-    """Резервный поиск через DuckDuckGo (без ключей, Termux-friendly).
+    """Резервный поиск без ключей (Termux-friendly), чтобы поисковик работал
+    всегда — автоматически используется, если Google CSE недоступен.
 
-    Автоматически используется, если Google CSE недоступен (ошибки доступа/API),
-    чтобы поисковик продолжал работать.
+    Порядок: DuckDuckGo HTML-выдача (не требует токенов) →lite DDG → i.js API.
     """
     offset = max(0, (page - 1) * 10)
-    last_err = None
-    headers = {"User-Agent": "Mozilla/5.0 (Android; Mobile) SearchGPT/1.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Android 13; Mobile) SearchGPT/1.0"}
+    items = []
+
+    # --- способ 1: обычный HTML-результат DDG -------------------------------
     try:
-        rr = requests.get("https://duckduckgo.com/", params={"q": query},
-                          headers=headers, timeout=10)
-        m = re.search(r"vqd=([\d-]+)", rr.text)
-        vqd = m.group(1) if m else ""
-        r = requests.get(
-            "https://duckduckgo.com/i.js",
-            params={"q": query, "vqd": vqd, "f": "json", "kl": "ru-es"},
-            headers={**headers, "Referer": "https://duckduckgo.com/"},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return {"error": f"DuckDuckGo: HTTP {r.status_code}"}
-        results = r.json().get("results", [])
-        items = []
-        for it in results[offset:offset + num]:
-            link = it.get("url", "")
-            host = urlparse(link).netloc
-            snippet = re.sub(r"<[^>]+>", "", it.get("abstract", "") or "")
-            title = re.sub(r"<[^>]+>", "", it.get("title", "") or "")
-            items.append({"title": title, "link": link, "snippet": snippet,
-                          "displayLink": host, "thumbnail": None})
-        if not items:
-            return {"error": "DuckDuckGo: пустая выдача"}
-        return {
-            "items": items,
-            "total": len(results),
-            "searchTime": None,
-            "hasMore": offset + num < len(results),
-            "provider": "duckduckgo",
-        }
-    except (requests.RequestException, ValueError) as e:
-        return {"error": f"Резервный поиск недоступен: {e}"}
+        r = requests.get("https://duckduckgo.com/html/",
+                         params={"q": query}, headers=headers, timeout=12)
+        if r.status_code == 200:
+            blocks = re.findall(
+                r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+                r'.*?class="result__snippet"[^>]*>(.*?)</a>',
+                r.text, re.S,
+            )
+            for href, title_html, snip_html in blocks:
+                link = href
+                m = re.search(r"uddq([^&]+)", link)  # редирект DDG -> чистый URL
+                if m:
+                    from urllib.parse import unquote
+                    link = unquote(m.group(1))
+                if not link.startswith(("http", "//")):
+                    continue
+                title = re.sub(r"<[^>]+>", "", title_html).strip()
+                snippet = re.sub(r"<[^>]+>", "", snip_html).strip()
+                host = urlparse(link).netloc or ""
+                items.append({"title": title, "link": normalize_link(link),
+                              "snippet": snippet, "displayLink": host,
+                              "thumbnail": None})
+    except requests.RequestException:
+        pass
+
+    # --- способ 2: lite-версия ----------------------------------------------
+    if not items:
+        try:
+            r = requests.get("https://lite.duckduckgo.com/lite/",
+                             params={"q": query}, headers=headers, timeout=12)
+            if r.status_code == 200:
+                links = re.findall(
+                    r'<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                    r.text, re.S)
+                snips = re.findall(
+                    r'class="result-snippet"[^>]*>(.*?)</td>', r.text, re.S)
+                for i, (href, title_html) in enumerate(links):
+                    link = href
+                    m = re.search(r"uddq([^&]+)", link)
+                    if m:
+                        from urllib.parse import unquote
+                        link = unquote(m.group(1))
+                    if not link.startswith(("http", "//")):
+                        continue
+                    items.append({
+                        "title": re.sub(r"<[^>]+>", "", title_html).strip(),
+                        "link": normalize_link(link),
+                        "snippet": re.sub(r"<[^>]+>", "",
+                                          snips[i] if i < len(snips) else "").strip(),
+                        "displayLink": urlparse(link).netloc or "",
+                        "thumbnail": None})
+        except requests.RequestException:
+            pass
+
+    # --- способ 3: JSON API (может быть заблокирован) ------------------------
+    if not items:
+        try:
+            rr = requests.get("https://duckduckgo.com/", params={"q": query},
+                              headers=headers, timeout=10)
+            m = re.search(r"vqd=([\d-]+)", rr.text)
+            vqd = m.group(1) if m else ""
+            r = requests.get(
+                "https://duckduckgo.com/i.js",
+                params={"q": query, "vqd": vqd, "f": "json", "kl": "ru-es"},
+                headers={**headers, "Referer": "https://duckduckgo.com/"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                for it in r.json().get("results", []):
+                    link = it.get("url", "")
+                    items.append({
+                        "title": re.sub(r"<[^>]+>", "", it.get("title", "") or ""),
+                        "link": normalize_link(link),
+                        "snippet": re.sub(r"<[^>]+>", "", it.get("abstract", "") or ""),
+                        "displayLink": urlparse(link).netloc or "",
+                        "thumbnail": None})
+        except (requests.RequestException, ValueError):
+            pass
+
+    if not items:
+        return {"error": "Резервный поиск не вернул результатов (нет сети?)"}
+    page_items = items[offset:offset + num] or items[:num]
+    return {
+        "items": page_items,
+        "total": len(items),
+        "searchTime": None,
+        "hasMore": offset + num < len(items),
+        "provider": "duckduckgo",
+    }
 
 
 def google_search(query: str, page: int = 1, num: int = NUM_RESULTS, safe: bool = True):
@@ -843,10 +924,56 @@ def require_login():
     path = request.path
     if path == "/" or any(path.startswith(p) for p in PUBLIC_PATHS):
         return None
+    # Подстраховка после логина, если cookie сессии не прижилась в браузере:
+    # временный параметр _sid авторизует один переход.
+    sid = request.args.get("_sid", "")
+    if sid.isdigit() and not is_signed_in():
+        row = db().execute(
+            "SELECT id, username, email, provider, picture FROM users WHERE id=?",
+            (int(sid),),
+        ).fetchone()
+        if row:
+            session["user"] = {
+                "id": row["id"], "name": row["username"],
+                "email": row["email"] or "", "picture": row["picture"] or "",
+                "provider": row["provider"],
+            }
+            # редирект на ту же страницу БЕЗ _sid — там сессия уже живёт
+            clean = request.args.to_dict(flat=True)
+            clean.pop("_sid", None)
+            target = request.path + (("?" + urlencode(clean)) if clean else "")
+            return redirect(target)
     if not is_signed_in():
         nxt = request.full_path if request.query_string else request.path
         return redirect(url_for("login_page", next=nxt))
     return None
+
+
+@app.after_request
+def after_request(resp):
+    try:
+        resp = fix_login_redirects(resp)
+    except Exception:
+        pass
+    # HTTPS-прокси (cloudpub/ngrok): cookie настроек ставятся вручную, поэтому
+    # здесь добавляем им Secure/SameSite=None. Cookie сессии Flask сам делает
+    # Secure+SameSite=Lax при HTTPS (см. ProxyFix выше).
+    fwd_proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+    if fwd_proto == "https":
+        patched = []
+        had_cookie = False
+        for c in resp.headers.getlist("Set-Cookie"):
+            had_cookie = True
+            if "Secure" not in c:
+                c += "; Secure"
+            if "SameSite=Lax" in c:
+                c = c.replace("SameSite=Lax", "SameSite=None")
+            patched.append(c)
+        if had_cookie:
+            resp.headers.remove("Set-Cookie")
+            for c in patched:
+                resp.headers.add("Set-Cookie", c)
+    return resp
 
 
 @app.context_processor
@@ -862,6 +989,25 @@ def safe_next(target: str, default: str = "/") -> str:
     if target and target.startswith("/") and not target.startswith("//"):
         return target
     return default
+
+
+def fix_login_redirects(resp):
+    """После логина/регистрации браузер может не принять cookie сессии
+    (прокси cloudpub/ngrok без HTTPS, Safari в приватном режиме, Termux-браузер) —
+    тогда пользователя сразу кидало обратно на /login. Подстраховка: редирект
+    главной страницы (/) после входа оставляем чистым, а для защищённых
+    внутренних страниц добавляем ?_sid=<id> — по нему require_login авторизует
+    переход, даже если cookie не дожили."""
+    if resp.status_code == 302 and request.method == "POST":
+        uid = session.get("user", {}).get("id") if "user" in session else None
+        loc = resp.headers.get("Location", "")
+        if uid and loc.startswith("/") and not loc.startswith("//") \
+                and "_sid=" not in loc:
+            path = urlparse(loc).path
+            if path != "/":  # главная и так публичная — не усложняем URL
+                sep = "&" if "?" in loc else "?"
+                resp.headers["Location"] = f"{loc}{sep}_sid={uid}"
+    return resp
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1216,7 +1362,7 @@ def lucky(query=None):
     data = google_search(query, num=st["results_per_page"], safe=st["safe_search"])
     items = data.get("items", [])
     if items:
-        return redirect(items[0]["link"])
+        return redirect(normalize_link(items[0]["link"]))
     return redirect(url_for("search_page", q=query))
 
 
@@ -1323,11 +1469,19 @@ def api_search():
     if request.method == "POST":
         payload = request.get_json(silent=True) or {}
         query = (payload.get("query") or payload.get("q") or "").strip()
-        page = int(payload.get("page", 1) or 1)
+        try:
+            page = int(payload.get("page", 1) or 1)
+        except (TypeError, ValueError):
+            return jsonify({"error": {"code": 400,
+                                      "message": "Параметр 'page' — целое число"}}), 400
         want_ai = bool(payload.get("ai", False))
     else:
         query = request.args.get("q", "").strip()
-        page = int(request.args.get("page", 1) or 1)
+        try:
+            page = int(request.args.get("page", 1) or 1)
+        except (TypeError, ValueError):
+            return jsonify({"error": {"code": 400,
+                                      "message": "Параметр 'page' — целое число"}}), 400
         want_ai = request.args.get("ai", "0") in ("1", "true", "yes")
 
     if not query:
